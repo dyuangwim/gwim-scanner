@@ -7,9 +7,9 @@ app = Flask(__name__)
 
 def connect_production_db():
     return mysql.connector.connect(
-        host="149.28.152.191",
-        user="root",
-        password="fb267146d223afbd24e88d5ea8090b0b8cdc4254146fa62d",
+        host="",
+        user="",
+        password="",
         database="production",
         charset='utf8mb4'
     )
@@ -123,3 +123,4 @@ def get_summary(line):
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5001)
+
