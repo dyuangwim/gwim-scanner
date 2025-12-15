@@ -3,11 +3,13 @@ import csv
 import time
 import pymysql
 import threading
-from datetime import datetime
+from datetime import datetime, date
 from config import MYSQL_CONFIG, DEVICE_LINE, DEVICE_ID
 import sys
 import keyboard
 import RPi.GPIO as GPIO
+import mysql.connector
+import calendar
 
 # --- Debug mode switch ---
 DEBUG_MODE = True
@@ -169,6 +171,30 @@ def safe_int(value):
         return int(value)
     except:
         return None
+        
+def is_valid_staff_id(staff_id):
+    try:
+        debug("Connecting to allocation_m3 for staff verification...")
+        connection = mysql.connector.connect(
+            host="192.168.20.17",
+            user="itadmin",
+            password="itadmin@2018",
+            database="allocation_m3"
+        )
+        cursor = connection.cursor()
+        query = """
+                SELECT staffid FROM staff_list
+                WHERE staffpos = 'OPERATOR'
+        """
+        cursor.execute(query)
+        valid_ids = {row[0].strip().upper() for row in cursor.fetchall()}
+        connection.close()
+        debug(f"Retrieved {len(valid_ids)} staff IDs")
+        
+        return staff_id.upper() in valid_ids
+    except Excpetion as e:
+        debug(f"Staff DB connection error: {e}")
+        return False
 
 def normalize_barcode(code):
     return (
@@ -194,6 +220,7 @@ muf_info = None
 last_scan_time = 0
 last_barcode = None
 barcode_buffer = ""
+staff_id = None
 
 csv_lock = threading.Lock()
 
@@ -339,11 +366,15 @@ def upload_from_csv():
 def is_reset_code(barcode):
     normalized = normalize_barcode(barcode)
     return normalized in {normalize_barcode(r) for r in RESET_CODES}
+    
+def resolve_image_url(path):
+    path = path.strip().lstrip("../")
+    return f"http://192.168.20.17/{path}"
 
 # --- Barcode scan listener ---
 def on_key(event):
     global barcode_buffer, last_barcode, last_scan_time
-    global current_batch, current_muf, template_code, muf_info
+    global current_batch, current_muf, template_code, muf_info, staff_id
     global green_blink_running, green_blink_thread
     global red_alert_active, red_alert_thread, buzzer_alert_active, buzzer_alert_thread # Add new globals
 
@@ -386,7 +417,119 @@ def on_key(event):
             green_blink_thread.daemon = True
             green_blink_thread.start()
             debug("✅ Green light blinking (RESET)")
+        elif any(c.isalpha() for c in normalized_barcode):  # scanned input contains a letter → treat as staff ID
+            try:
+                conn = mysql.connector.connect(
+                    host="192.168.20.17",
+                    user="itadmin",
+                    password="itadmin@2018",
+                    database="allocation_m3"
+                )
+                cursor = conn.cursor(dictionary=True)
+                today_str = datetime.now().strftime('%Y-%m-%d')
+                now_dt = datetime.now()
 
+                if staff_id is None:
+                    if not is_valid_staff_id(normalized_barcode):
+                        debug(f"Invalid staff ID: {normalized_barcode}")
+                        blink_light(RED_PIN, times=1)
+                        buzz(times=1)
+                        return
+
+                    staff_id = normalized_barcode
+                    debug(f"✅ Valid staff ID detected: {staff_id}")
+
+                    cursor.execute("SELECT * FROM staff_list WHERE staffid = %s", (staff_id,))
+                    staff_row = cursor.fetchone()
+                    if not staff_row:
+                        debug("❌ Staff ID not found in DB after validation")
+                        blink_light(RED_PIN, times=1)
+                        buzz(times=1)
+                        return
+
+                    shift = staff_row.get("shift", "").upper()
+                    shift_value = "DAY" if "DAY" in shift else "NIGHT" if "NIGHT" in shift else ""
+
+                    # allocation_temp
+                    cursor.execute("DELETE FROM allocation_temp WHERE staffid = %s", (staff_id,))
+                    cursor.execute("""
+                            INSERT INTO allocation_temp (staffid, line, staffname, staffpos, staffdept, status, remark, created_date, pic, flg)
+                            VALUES (%s, %s, %s, %s, %s, 'IN', '', %s, %s, NULL)
+                        """, (
+                        staff_id, DEVICE_LINE, staff_row["staffname"], staff_row["staffpos"],
+                        staff_row["staffdept"], now_dt.date(), resolve_image_url(staff_row["pic"])
+                    ))
+
+                    # allcation_log
+                    cursor.execute("SELECT id FROM allcation_log WHERE employee_id = %s AND date_run = %s",
+                                   (staff_id, today_str))
+                    log_row = cursor.fetchone()
+                    if log_row:
+                        cursor.execute("UPDATE allcation_log SET out_datetime = %s, status = 'OUT' WHERE id = %s",
+                                       (now_dt, log_row["id"]))
+                    else:
+                        cursor.execute("""
+                                INSERT INTO allcation_log (
+                                    line, employee_id, name, job_title, department, datetime_log, status, remark,
+                                    file_path, date_run, in_datetime, out_datetime, time_taken, shift
+                                ) VALUES (%s, %s, %s, %s, %s, %s, 'IN', '', %s, %s, %s, NULL, 0.00, %s)
+                            """, (
+                            DEVICE_LINE, staff_id, staff_row["staffname"], staff_row["staffpos"],
+                            staff_row["staffdept"], now_dt, resolve_image_url(staff_row["pic"]), today_str, now_dt, shift_value
+                        ))
+
+                    # prod_attendance
+                    cursor.execute("SELECT id FROM prod_attendance WHERE staffid = %s AND date = %s",
+                                   (staff_id, today_str))
+                    att_row = cursor.fetchone()
+                    if att_row:
+                        cursor.execute("UPDATE prod_attendance SET timeout = %s WHERE id = %s",
+                                       (now_dt, att_row["id"]))
+                    else:
+                        cursor.execute("""
+                                INSERT INTO prod_attendance (
+                                    staffid, name, staffpos, staffdept, timein, timeout, work_hr, pic, staffic,
+                                    date, shift, flg, staffagency, day
+                                ) VALUES (%s, %s, %s, %s, %s, NULL, 0.00, %s, NULL, %s, %s, NULL, %s, %s)
+                            """, (
+                            staff_id, staff_row["staffname"], staff_row["staffpos"], staff_row["staffdept"],
+                            now_dt, resolve_image_url(staff_row["pic"]), today_str, shift_value,
+                            staff_row.get("staffagency", ""), calendar.day_name[now_dt.weekday()]
+                        ))
+
+                    conn.commit()
+                    debug("✅ Staff IN logic complete")
+                    blink_light(GREEN_PIN, times=1)
+                    buzz(times=1)
+
+                elif normalized_barcode == staff_id:
+                    debug(f"🔁 OUT scan for {staff_id}, clearing session")
+
+                    cursor.execute("SELECT id FROM allcation_log WHERE employee_id = %s AND date_run = %s",
+                                   (staff_id, today_str))
+                    row = cursor.fetchone()
+                    if row:
+                        cursor.execute("UPDATE allcation_log SET out_datetime = %s, status = 'OUT' WHERE id = %s",
+                                       (now_dt, row["id"]))
+
+                    cursor.execute("SELECT id FROM prod_attendance WHERE staffid = %s AND date = %s",
+                                   (staff_id, today_str))
+                    row = cursor.fetchone()
+                    if row:
+                        cursor.execute("UPDATE prod_attendance SET timeout = %s WHERE id = %s",
+                                       (now_dt, row["id"]))
+
+                    conn.commit()
+                    staff_id = None
+                    blink_light(GREEN_PIN, times=1)
+                    buzz(times=1)
+
+                conn.close()
+
+            except Exception as e:
+                debug(f"🔥 Error during staff ID scan: {e}")
+                blink_light(RED_PIN, times=1)
+                buzz(times=1)
 
         elif not current_batch:
             debug("⚠️ Please scan RESET first.")
