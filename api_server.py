@@ -1,3 +1,5 @@
+import math
+
 from flask import Flask, jsonify
 import mysql.connector
 from datetime import datetime as dt, timedelta
@@ -7,9 +9,9 @@ app = Flask(__name__)
 
 def connect_production_db():
     return mysql.connector.connect(
-        host="",
-        user="",
-        password="",
+        host="149.28.152.191",
+        user="root",
+        password="fb267146d223afbd24e88d5ea8090b0b8cdc4254146fa62d",
         database="production",
         charset='utf8mb4'
     )
@@ -114,7 +116,7 @@ def get_summary(line):
     summary = {
         "muf_no": muf_no,
         "total_carton_needed": qty_done,
-        "target_hour": int(pack_per_hr // pack_per_ctn),
+        "target_hour": math.ceil(pack_per_hr / pack_per_ctn),
         "avg_hourly_output": get_average_hourly_output(muf_no, line),
         "balance_carton": balance_cartons,
         "balance_hours": balance_hours
@@ -123,4 +125,3 @@ def get_summary(line):
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5001)
-
