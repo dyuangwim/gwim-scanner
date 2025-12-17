@@ -1,0 +1,2 @@
+nc -zv 192.168.20.17 3306
+python3 -c "import pymysql; print('try'); conn=pymysql.connect(host='192.168.20.17',user='itadmin',password='itadmin@2018',database='production',connect_timeout=3); print('ok'); conn.close()"
