@@ -1,10 +1,18 @@
-# main.py
+#!/usr/bin/env python3
+# main.py  (Option 1 - Intranet DB; per-line independent)
+# ==========================================================
+# Key fixes:
+# - No more IndexError from empty CSV (skip & optionally remove 0-byte CSV)
+# - Startup logs folder writability check (prints exact chown command)
+# - DB connect timeouts to avoid long hangs
+# - Keeps original scanning logic: RESET -> staff -> MUF -> TEMPLATE -> SCAN
+# ==========================================================
+
 import os
 import csv
 import time
 import threading
 import sys
-import traceback
 import subprocess
 from datetime import datetime
 
@@ -29,7 +37,7 @@ def debug(msg: str):
         print(f"[DEBUG] {msg}")
 
 # -------------------- Relay Tower Lamp (LOW=ON / HIGH=OFF) --------------------
-# Change GPIO pins if your hardware wiring differs
+# Adjust pins if needed
 GPIO_GREEN  = 6
 GPIO_RED    = 13
 GPIO_YELLOW = 19
@@ -49,48 +57,60 @@ def tower_all_off():
     GPIO.output(GPIO_YELLOW, GPIO.HIGH)
     GPIO.output(GPIO_BUZZER, GPIO.HIGH)
 
-tower_all_off()
+def green_on():   GPIO.output(GPIO_GREEN, GPIO.LOW)
+def green_off():  GPIO.output(GPIO_GREEN, GPIO.HIGH)
+def red_on():     GPIO.output(GPIO_RED, GPIO.LOW)
+def red_off():    GPIO.output(GPIO_RED, GPIO.HIGH)
+def yellow_on():  GPIO.output(GPIO_YELLOW, GPIO.LOW)
+def yellow_off(): GPIO.output(GPIO_YELLOW, GPIO.HIGH)
 
 def buzzer_beep(seconds=0.25):
     GPIO.output(GPIO_BUZZER, GPIO.LOW)
     time.sleep(seconds)
     GPIO.output(GPIO_BUZZER, GPIO.HIGH)
 
-def red_on():
-    GPIO.output(GPIO_RED, GPIO.LOW)
+tower_all_off()
 
-def red_off():
-    GPIO.output(GPIO_RED, GPIO.HIGH)
-
-def green_on():
-    GPIO.output(GPIO_GREEN, GPIO.LOW)
-
-def green_off():
-    GPIO.output(GPIO_GREEN, GPIO.HIGH)
-
-def yellow_on():
-    GPIO.output(GPIO_YELLOW, GPIO.LOW)
-
-def yellow_off():
-    GPIO.output(GPIO_YELLOW, GPIO.HIGH)
-
-# -------------------- Logging to file --------------------
+# -------------------- File/Log setup --------------------
 os.makedirs(CSV_FOLDER, exist_ok=True)
 
+# Redirect stdout/stderr to log file (line-buffered)
 try:
     sys.stdout = open(LOG_PATH, "a", buffering=1)
     sys.stderr = sys.stdout
-    debug("🔁 Script started (log ready)")
-except Exception as e:
-    # last-resort fallback
-    with open("/home/pi/gwim-scanner/gwim_fallback.txt", "a") as f:
-        f.write(f"Logging failed: {e}\n")
+except Exception:
+    # If we can't open log, we still continue with default stdout
+    pass
+
+debug("🔁 Script started (log ready)")
+debug("🟩 GPIO initialized (relay LOW=ON, HIGH=OFF)")
+
+def ensure_logs_writable() -> bool:
+    """
+    Prevent your old 'permission + empty csv' loop.
+    If folder isn't writable, we don't crash; we warn clearly.
+    """
+    test_path = os.path.join(CSV_FOLDER, ".write_test")
+    try:
+        with open(test_path, "w") as f:
+            f.write("ok")
+        os.remove(test_path)
+        debug(f"✅ Logs folder writable: {CSV_FOLDER}")
+        return True
+    except Exception as e:
+        debug(f"❌ Logs folder NOT writable: {CSV_FOLDER} ({e})")
+        debug("Fix by running on Raspberry Pi terminal:")
+        debug("  sudo chown -R pi:pi /home/pi/gwim-scanner/logs")
+        debug("  sudo chmod -R 775 /home/pi/gwim-scanner/logs")
+        return False
+
+LOGS_WRITABLE = ensure_logs_writable()
 
 # -------------------- Helpers --------------------
-def safe_int(value):
+def safe_int(v):
     try:
-        return int(value)
-    except:
+        return int(v)
+    except Exception:
         return None
 
 def normalize_barcode(code: str) -> str:
@@ -103,15 +123,13 @@ def normalize_barcode(code: str) -> str:
             .upper()
     )
 
+RESET_SET = {normalize_barcode(x) for x in RESET_CODES}
+
 def is_reset_code(barcode: str) -> bool:
-    normalized = normalize_barcode(barcode)
-    return normalized in {normalize_barcode(r) for r in RESET_CODES}
+    return normalize_barcode(barcode) in RESET_SET
 
 def looks_like_staff_id(barcode: str) -> bool:
-    """
-    Your original logic: staff ID contains letters.
-    E.g. 'AB1234' → staff id
-    """
+    # Your original logic: contains letters
     b = normalize_barcode(barcode)
     return any(c.isalpha() for c in b)
 
@@ -119,7 +137,7 @@ def ping_ok(ip="8.8.8.8") -> bool:
     try:
         subprocess.check_output(["ping", "-c", "1", "-W", "1", ip])
         return True
-    except:
+    except Exception:
         return False
 
 def connect_pymysql(db_cfg: dict, dict_cursor=False):
@@ -129,48 +147,86 @@ def connect_pymysql(db_cfg: dict, dict_cursor=False):
         password=db_cfg["password"],
         database=db_cfg["database"],
         port=int(db_cfg.get("port", 3306)),
-        connect_timeout=DB_CONNECT_TIMEOUT,
-        read_timeout=DB_READ_TIMEOUT,
-        write_timeout=DB_WRITE_TIMEOUT,
+        connect_timeout=int(DB_CONNECT_TIMEOUT),
+        read_timeout=int(DB_READ_TIMEOUT),
+        write_timeout=int(DB_WRITE_TIMEOUT),
         autocommit=True,
     )
     if dict_cursor:
         kwargs["cursorclass"] = pymysql.cursors.DictCursor
     return pymysql.connect(**kwargs)
 
-# -------------------- CSV write + upload --------------------
+# -------------------- CSV storage + upload --------------------
 csv_lock = threading.Lock()
+
+def _csv_path_for_muf(muf_no: str) -> str:
+    date_str = datetime.now().strftime("%Y%m%d")
+    return os.path.join(CSV_FOLDER, f"{muf_no}_{date_str}.csv")
+
+CSV_HEADER = [
+    "muf_no", "line", "fg_no", "pack_per_ctn", "pack_per_hr",
+    "actual_pack", "ctn_count", "scanned_code", "scanned_count",
+    "scanned_at", "scanned_by", "remarks", "is_uploaded"
+]
 
 def write_to_csv(row_tuple, muf_no: str, uploaded: int, remarks: str):
     """
-    Keep your caching logic: always write a row to CSV.
-    If uploaded=1 means already inserted into DB successfully.
+    Always cache to CSV (your original design).
+    If logs folder not writable, just log warning and return.
     """
+    if not LOGS_WRITABLE:
+        debug("⚠️ CSV not written because logs folder not writable.")
+        return
+
+    path = _csv_path_for_muf(muf_no)
     with csv_lock:
-        filename = os.path.join(CSV_FOLDER, f"{muf_no}_{datetime.now().strftime('%Y%m%d')}.csv")
-        is_new = not os.path.exists(filename)
+        is_new = not os.path.exists(path)
+        try:
+            with open(path, "a", newline="") as f:
+                w = csv.writer(f)
+                if is_new:
+                    w.writerow(CSV_HEADER)
+                w.writerow(list(row_tuple) + [remarks, int(uploaded)])
+            debug(f"📂 CSV saved: {path} (uploaded={uploaded}, remarks={remarks})")
+        except Exception as e:
+            debug(f"⚠️ CSV write failed: {path} ({e})")
 
-        with open(filename, "a", newline="") as f:
-            writer = csv.writer(f)
-            if is_new:
-                writer.writerow([
-                    "muf_no", "line", "fg_no", "pack_per_ctn", "pack_per_hr",
-                    "actual_pack", "ctn_count", "scanned_code", "scanned_count",
-                    "scanned_at", "scanned_by", "remarks", "is_uploaded"
-                ])
-            writer.writerow(list(row_tuple) + [remarks, int(uploaded)])
+def _read_csv_rows(path: str):
+    """
+    Return (rows, header_ok).
+    rows includes header as rows[0] if present.
+    """
+    try:
+        with open(path, "r", newline="") as f:
+            rows = list(csv.reader(f))
+        if not rows:
+            return [], False
+        if rows[0] != CSV_HEADER:
+            # allow old header, but still treat as readable; we just won't validate strictly
+            return rows, True
+        return rows, True
+    except Exception:
+        return [], False
 
-        debug(f"📂 Written CSV: {filename} (uploaded={uploaded}, remarks={remarks})")
+def _write_csv_rows(path: str, rows):
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerows(rows)
 
 def upload_from_csv():
     """
-    Every UPLOAD_INTERVAL_SEC:
-    - Find CSV rows where is_uploaded=0
-    - Insert them into output_log
-    - Mark uploaded rows as 1
+    Periodically:
+    - Skip / remove 0-byte files
+    - Skip empty or header-only CSV
+    - Insert pending rows (is_uploaded=0) into production.output_log
+    - Mark those rows as uploaded=1 in the CSV
     """
     try:
-        debug("⏫ Upload thread: attempting to upload cached CSV data...")
+        debug("⏫ Attempting to upload cached CSV data...")
+
+        if not os.path.isdir(CSV_FOLDER):
+            debug(f"⚠️ CSV folder not found: {CSV_FOLDER}")
+            return
 
         for file in os.listdir(CSV_FOLDER):
             if not file.endswith(".csv"):
@@ -178,27 +234,49 @@ def upload_from_csv():
 
             path = os.path.join(CSV_FOLDER, file)
 
-            with csv_lock:
-                with open(path, "r", newline="") as f:
-                    rows = list(csv.reader(f))
-                if len(rows) <= 1:
+            # --- Fix for your old bug: empty file -> IndexError in old code ---
+            # If 0 bytes, remove it to avoid repeat crashes.
+            try:
+                if os.path.getsize(path) == 0:
+                    debug(f"🧹 Empty (0-byte) CSV found, removing: {path}")
+                    try:
+                        os.remove(path)
+                    except Exception as e:
+                        debug(f"⚠️ Cannot remove empty CSV: {path} ({e})")
                     continue
-                header = rows[0]
-                data_rows = rows[1:]
+            except Exception as e:
+                debug(f"⚠️ Cannot stat CSV: {path} ({e})")
+                continue
 
-            # collect not uploaded
-            pending = []
-            for r in data_rows:
+            with csv_lock:
+                rows, ok = _read_csv_rows(path)
+
+            if not ok or len(rows) <= 1:
+                # empty or header-only (or unreadable) -> skip; do not crash
+                debug(f"ℹ️ Skip CSV (empty/header-only/unreadable): {path}")
+                continue
+
+            header = rows[0]
+            data_rows = rows[1:]
+
+            # Find pending rows: last column is is_uploaded
+            pending_indices = []
+            pending_values = []
+
+            for idx, r in enumerate(data_rows, start=1):
                 if len(r) < 13:
                     continue
                 if r[-1] == "0":
-                    pending.append(r)
+                    # first 12 columns match DB insert, r[11] is remarks
+                    pending_indices.append(idx)
+                    pending_values.append(r[:12])
 
-            if not pending:
+            if not pending_values:
                 continue
 
-            debug(f"⏫ Found {len(pending)} pending rows: {path}")
+            debug(f"⏫ Pending rows: {len(pending_values)} in {path}")
 
+            # Insert all pending
             try:
                 conn = connect_pymysql(PRODUCTION_DB, dict_cursor=False)
                 cur = conn.cursor()
@@ -208,39 +286,35 @@ def upload_from_csv():
                     "ctn_count, scanned_code, scanned_count, scanned_at, scanned_by, remarks"
                     ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
                 )
-
-                for r in pending:
-                    # r: 0..10 are original fields, r[11]=remarks, r[12]=is_uploaded
-                    cur.execute(sql, r[:12])
-
+                for v in pending_values:
+                    cur.execute(sql, v)
                 conn.commit()
                 cur.close()
                 conn.close()
 
-                # mark as uploaded
+                # Mark uploaded
                 with csv_lock:
-                    for i in range(1, len(rows)):
-                        if len(rows[i]) >= 13 and rows[i][-1] == "0":
+                    for i in pending_indices:
+                        if len(rows[i]) >= 13:
                             rows[i][-1] = "1"
-                    with open(path, "w", newline="") as f:
-                        writer = csv.writer(f)
-                        writer.writerows(rows)
+                    try:
+                        _write_csv_rows(path, rows)
+                    except Exception as e:
+                        debug(f"⚠️ Failed to mark uploaded in CSV: {path} ({e})")
 
                 debug(f"✅ Uploaded & marked: {path}")
 
             except Exception as e:
-                debug(f"⚠️ Upload failed for {path}: {e}")
+                debug(f"⚠️ Upload failed: {path} ({e})")
 
     except Exception as e:
         debug(f"⚠️ upload_from_csv unexpected error: {e}")
 
+    # schedule next run
     threading.Timer(UPLOAD_INTERVAL_SEC, upload_from_csv).start()
 
-# -------------------- Staff IN/OUT logic --------------------
+# -------------------- Staff IN/OUT --------------------
 def is_valid_staff_id(staff_id: str) -> bool:
-    """
-    Valid staff ID must exist in allocation_m3.staff table.
-    """
     staff_id = normalize_barcode(staff_id)
     try:
         conn = connect_pymysql(STAFF_DB, dict_cursor=False)
@@ -250,27 +324,23 @@ def is_valid_staff_id(staff_id: str) -> bool:
         cur.close()
         conn.close()
         return ok
-    except Exception as e:   # <-- fixed typo
+    except Exception as e:
         debug(f"Staff DB connection error: {e}")
         return False
 
 def toggle_staff_status(staff_id: str) -> str:
     """
-    Mimic your logic:
-    - If no status row: INSERT IN
-    - If status = IN: set OUT
-    - If status = OUT: set IN
-    Return "IN" or "OUT" or "ERROR"
+    - If no row: INSERT IN
+    - If IN -> OUT, else OUT -> IN
     """
     staff_id = normalize_barcode(staff_id)
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
         conn = connect_pymysql(STAFF_DB, dict_cursor=False)
         cur = conn.cursor()
 
         cur.execute("SELECT status FROM staff_status WHERE staff_id=%s LIMIT 1", (staff_id,))
         row = cur.fetchone()
-
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         if row is None:
             cur.execute(
@@ -283,12 +353,18 @@ def toggle_staff_status(staff_id: str) -> str:
 
         status = row[0]
         if status == "IN":
-            cur.execute("UPDATE staff_status SET status='OUT', updated_at=%s WHERE staff_id=%s", (now_str, staff_id))
+            cur.execute(
+                "UPDATE staff_status SET status='OUT', updated_at=%s WHERE staff_id=%s",
+                (now_str, staff_id)
+            )
             conn.commit()
             cur.close(); conn.close()
             return "OUT"
         else:
-            cur.execute("UPDATE staff_status SET status='IN', updated_at=%s WHERE staff_id=%s", (now_str, staff_id))
+            cur.execute(
+                "UPDATE staff_status SET status='IN', updated_at=%s WHERE staff_id=%s",
+                (now_str, staff_id)
+            )
             conn.commit()
             cur.close(); conn.close()
             return "IN"
@@ -297,12 +373,8 @@ def toggle_staff_status(staff_id: str) -> str:
         debug(f"toggle_staff_status error: {e}")
         return "ERROR"
 
-# -------------------- Production DB: MUF + insert --------------------
+# -------------------- Production: MUF + output_log insert --------------------
 def fetch_muf_info(muf_code: str):
-    """
-    Query production.main for muf_no.
-    Return dict row or None.
-    """
     muf_code = normalize_barcode(muf_code)
     try:
         conn = connect_pymysql(PRODUCTION_DB, dict_cursor=True)
@@ -315,10 +387,11 @@ def fetch_muf_info(muf_code: str):
         debug(f"fetch_muf_info DB error: {e}")
         return None
 
-def insert_output_log(data_tuple, remarks: str) -> bool:
+def insert_output_log(data_tuple_11_fields, remarks: str) -> bool:
     """
-    Insert one row into output_log.
-    Return True if success else False.
+    data_tuple_11_fields:
+      (muf_no, line, fg_no, pack_per_ctn, pack_per_hr, actual_pack,
+       ctn_count, scanned_code, scanned_count, scanned_at, scanned_by)
     """
     try:
         conn = connect_pymysql(PRODUCTION_DB, dict_cursor=False)
@@ -329,7 +402,7 @@ def insert_output_log(data_tuple, remarks: str) -> bool:
             "ctn_count, scanned_code, scanned_count, scanned_at, scanned_by, remarks"
             ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
         )
-        cur.execute(sql, data_tuple + (remarks,))
+        cur.execute(sql, data_tuple_11_fields + (remarks,))
         conn.commit()
         cur.close(); conn.close()
         return True
@@ -337,7 +410,7 @@ def insert_output_log(data_tuple, remarks: str) -> bool:
         debug(f"⚠️ DB insert failed: {e}")
         return False
 
-# -------------------- Network indicator thread --------------------
+# -------------------- Network indicator (yellow lamp) --------------------
 def network_indicator_loop():
     while True:
         try:
@@ -349,50 +422,50 @@ def network_indicator_loop():
                 yellow_on()
                 time.sleep(0.2)
                 yellow_off()
-        except:
+        except Exception:
             pass
         time.sleep(10)
 
-# -------------------- Main scanning state --------------------
+# -------------------- Scanning state --------------------
 current_batch = None
 current_muf = None
 muf_info = None
 template_code = None
 barcode_buffer = ""
+
 last_barcode = None
 last_scan_time = 0.0
-staff_id = None  # current staff logged IN
+
+staff_id = None  # current staff who is IN
 
 def set_state_reset():
     global current_batch, current_muf, muf_info, template_code
-    global staff_id
     now = datetime.now()
     current_batch = f"batch_{now.strftime('%Y%m%d_%H%M%S')}"
     current_muf = None
     muf_info = None
     template_code = None
     debug(f"🔄 RESET scanned. New batch: {current_batch}")
-    # green blink to indicate need MUF
-    green_off()
+
     red_off()
+    green_off()
 
 def process_and_store(scanned_barcode: str, remarks: str):
     """
-    Preserve your data shape + logic.
+    Keep original behavior: insert output_log + write CSV (fallback).
     """
     global current_muf, muf_info, staff_id
 
     pack_per_ctn = safe_int(muf_info.get("pack_per_ctn"))
     pack_per_hr  = safe_int(muf_info.get("pack_per_hr"))
+
     ctn_count = 1
     actual_pack = (pack_per_ctn * ctn_count) if pack_per_ctn is not None else None
 
-    now = datetime.now()
-    timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
-
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     scanned_by = staff_id if staff_id else DEVICE_ID
 
-    row_tuple = (
+    data_11 = (
         current_muf,
         DEVICE_LINE,
         muf_info.get("fg_no"),
@@ -402,21 +475,21 @@ def process_and_store(scanned_barcode: str, remarks: str):
         ctn_count,
         scanned_barcode,
         1,
-        timestamp,
+        ts,
         scanned_by,
     )
 
-    ok = insert_output_log(row_tuple, remarks=remarks)
+    ok = insert_output_log(data_11, remarks=remarks)
     if ok:
         debug("✅ DB insert successful")
-        write_to_csv(row_tuple, current_muf, uploaded=1, remarks=remarks)
+        write_to_csv(data_11, current_muf, uploaded=1, remarks=remarks)
         green_on()
         red_off()
         buzzer_beep(0.08)
     else:
         debug("⚠️ DB insert failed. Cached locally.")
-        write_to_csv(row_tuple, current_muf, uploaded=0, remarks=remarks)
-        # still show success beep (your original did 1 blink); keep minimal beep
+        write_to_csv(data_11, current_muf, uploaded=0, remarks=remarks)
+        # keep minimal beep so operator feedback still exists
         buzzer_beep(0.08)
 
 # -------------------- Keyboard handler --------------------
@@ -434,8 +507,8 @@ def on_key(event):
         normalized = normalize_barcode(barcode)
         now_ts = time.time()
 
-        # Prevent duplicate scans within SCAN_INTERVAL
-        if barcode == last_barcode and (now_ts - last_scan_time) < SCAN_INTERVAL:
+        # Prevent duplicate scan within interval
+        if barcode == last_barcode and (now_ts - last_scan_time) < float(SCAN_INTERVAL):
             debug(f"⏱️ Duplicate scan ignored: {barcode}")
             return
 
@@ -447,59 +520,58 @@ def on_key(event):
         # 1) RESET
         if is_reset_code(barcode):
             set_state_reset()
-            # blink green a bit to show ready
+            # green blink to show ready
             green_on(); time.sleep(0.2); green_off(); time.sleep(0.2); green_on()
             return
 
-        # Must RESET first
+        # Require RESET first
         if not current_batch:
             debug("⚠️ Please scan RESET first.")
             red_on()
-            buzzer_beep(0.3)
+            buzzer_beep(0.30)
             return
 
-        # 2) Staff ID (contains letters)
+        # 2) Staff ID
         if looks_like_staff_id(barcode):
             candidate = normalize_barcode(barcode)
             if not is_valid_staff_id(candidate):
                 debug(f"❌ Invalid staff ID: {candidate}")
                 red_on()
-                buzzer_beep(0.3)
+                buzzer_beep(0.30)
                 return
 
             status = toggle_staff_status(candidate)
             if status == "IN":
                 staff_id = candidate
                 debug(f"👤 Staff IN: {staff_id}")
-                green_on()
-                red_off()
+                green_on(); red_off()
                 buzzer_beep(0.08)
             elif status == "OUT":
                 debug(f"👤 Staff OUT: {candidate}")
-                # if current staff same, clear
                 if staff_id == candidate:
                     staff_id = None
-                green_off()
-                red_off()
+                green_off(); red_off()
                 buzzer_beep(0.08)
             else:
                 debug("⚠️ Staff status update ERROR")
                 red_on()
-                buzzer_beep(0.3)
+                buzzer_beep(0.30)
             return
 
-        # 3) MUF not set yet -> treat next barcode as MUF
+        # 3) MUF not set yet -> treat this as MUF
         if current_muf is None:
             info = fetch_muf_info(normalized)
             if not info:
                 debug(f"❌ MUF not found: {normalized}")
                 red_on()
-                buzzer_beep(0.3)
+                buzzer_beep(0.30)
                 return
+
             current_muf = normalized
             muf_info = info
             template_code = None
             debug(f"✅ MUF set: {current_muf} (fg_no={muf_info.get('fg_no')})")
+
             # green blink to prompt template
             green_on(); time.sleep(0.2); green_off(); time.sleep(0.2); green_on()
             red_off()
@@ -507,13 +579,14 @@ def on_key(event):
 
         # 4) TEMPLATE not set yet
         if template_code is None:
-            # ignore if someone scanned MUF again
             if normalized == current_muf:
-                debug("⚠️ Duplicate MUF scanned, ignoring as template.")
+                debug("⚠️ MUF scanned again; ignoring as template.")
                 return
+
             template_code = normalized
             debug(f"🧾 Template set: {template_code}")
-            # record template as one carton
+
+            # record template as one carton (original behavior)
             process_and_store(template_code, remarks="TEMPLATE")
             return
 
@@ -533,16 +606,18 @@ def on_key(event):
     elif event.name == "minus":
         barcode_buffer += "-"
 
-# -------------------- Main --------------------
+# -------------------- Entry point --------------------
 if __name__ == "__main__":
     debug(f"🚀 Starting scanner: line={DEVICE_LINE}, device={DEVICE_ID}")
-    # upload pending every 5 min
+    debug(f"📁 CSV folder: {CSV_FOLDER}")
+
+    # Start periodic upload thread
     upload_from_csv()
 
-    # network indicator
+    # Start network indicator
     threading.Thread(target=network_indicator_loop, daemon=True).start()
 
-    # start listening
+    # Start barcode listening
     debug("🧭 Listening for barcode scan via keyboard...")
     keyboard.on_press(on_key)
     keyboard.wait()
