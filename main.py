@@ -30,7 +30,7 @@ DEBUG_MODE = True
 ERROR_ALERT_MODE = "blink"   # <-- if you want continuous ON, change to "solid"
 
 # Relay polarity (your old code assumes LOW=ON HIGH=OFF)
-ACTIVE_LOW = True
+ACTIVE_LOW = False # HF6 using Relay so using "True", others line no using Relay so using "False"
 CHANNEL_ACTIVE_LOW = {
     "RED": ACTIVE_LOW,
     "GREEN": ACTIVE_LOW,
@@ -644,3 +644,4 @@ if __name__ == "__main__":
     debug("🧭 Listening for barcode scan via keyboard...")
     keyboard.on_press(on_key)
     keyboard.wait()
+
