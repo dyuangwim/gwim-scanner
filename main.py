@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
 # main.py (Option 1 - Intranet DB + Perfect tower-light behavior + Relay safe polarity)
 # =================================================================================
-# Matches your "perfect flow" behavior (per documentation):
+# PERFECT FLOW (matches your old “perfect”):
 # GREEN:
 #   - boot: fast blink 5 times (0.2 ON / 0.1 OFF)
 #   - waiting RESET: slow blink (0.5 ON / 0.5 OFF)
-#   - RESET scanned: restart slow blinking (new batch)
-#   - MUF valid: keep slow blinking
-#   - Template (first carton): solid ON and stays ON
-# RED + BUZZER:
-#   - errors: continuous red blink (0.5/0.5) + continuous beeping (0.15 ON / 0.5 OFF)
-#   - stop alerts on ANY next scan (like your old stop_all_alerts())
+#   - RESET scanned: restart fast->slow blinking
+#   - MUF valid: keep blinking
+#   - Template set: green solid ON
+#
 # YELLOW:
 #   - internet ok: solid ON
-#   - internet down: blink once (0.5 ON) every 10 seconds
+#   - internet down: blink once (0.5s ON) every 10 sec
 #
-# Also includes:
-# - CSV empty/0-byte defensive handling (fix old IndexError loop)
-# - logs folder writable check + clear instruction
-# - DB timeouts (avoid hang)
-# - Relay polarity support (avoid buzzer stuck ON)
+# ERROR (IMPORTANT FIX):
+#   - error: red blinks continuously AND buzzer stays ON continuously
+#   - stop alerts on ANY next scan
+#   - uses persistent threads + Event (no race condition, never “red only no buzzer”)
+#
+# DB/CSV:
+#   - inserts into intranet DB (PRODUCTION_DB)
+#   - always writes CSV; marks uploaded=1 when DB insert ok
+#   - upload_from_csv: removes 0-byte files; skips empty/header-only; uploads pending rows
 # =================================================================================
 
 import os
@@ -52,20 +54,17 @@ def debug(msg: str):
         print(f"[DEBUG] {msg}")
 
 # -------------------- OUTPUT POLARITY (Relay vs Direct LED) --------------------
-# Your hardware in documentation uses 8-ch relay, typical Active-Low inputs.
-# If buzzer wiring differs, override BUZZER below.
-ACTIVE_LOW = True  # relay device
+ACTIVE_LOW = True  # relay device typical
 CHANNEL_ACTIVE_LOW = {
     "RED":    ACTIVE_LOW,
     "GREEN":  ACTIVE_LOW,
     "YELLOW": ACTIVE_LOW,
     "BUZZER": ACTIVE_LOW,
 }
+# If buzzer wiring differs, override:
+# CHANNEL_ACTIVE_LOW["BUZZER"] = False
 
 # -------------------- GPIO PINS (BCM) --------------------
-# Per your documentation wiring:
-# IN1 GPIO5, IN2 GPIO6, IN3 GPIO13, IN4 GPIO19
-# Red=GPIO5, Green=GPIO6, Yellow=GPIO13, Buzzer=GPIO19:contentReference[oaicite:1]{index=1}
 RED_PIN    = 5
 GREEN_PIN  = 6
 YELLOW_PIN = 13
@@ -77,7 +76,6 @@ for p in (RED_PIN, GREEN_PIN, YELLOW_PIN, BUZZER_PIN):
     GPIO.setup(p, GPIO.OUT)
 
 def _pin_write(pin: int, on: bool, active_low: bool):
-    # active_low: ON=LOW, OFF=HIGH
     if active_low:
         GPIO.output(pin, GPIO.LOW if on else GPIO.HIGH)
     else:
@@ -91,7 +89,6 @@ def buzzer(on: bool): _pin_write(BUZZER_PIN, on, CHANNEL_ACTIVE_LOW["BUZZER"])
 def tower_all_off():
     red(False); green(False); yellow(False); buzzer(False)
 
-# Safety at boot
 tower_all_off()
 
 # -------------------- File/Log setup --------------------
@@ -122,7 +119,7 @@ def ensure_logs_writable() -> bool:
 
 LOGS_WRITABLE = ensure_logs_writable()
 
-# -------------------- Helper functions --------------------
+# -------------------- Helpers --------------------
 def safe_int(v):
     try:
         return int(v)
@@ -148,9 +145,11 @@ def looks_like_staff_id(barcode: str) -> bool:
 
 def check_internet() -> bool:
     try:
-        return subprocess.call(["ping", "-c", "1", "-W", "1", "8.8.8.8"],
-                               stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL) == 0
+        return subprocess.call(
+            ["ping", "-c", "1", "-W", "1", "8.8.8.8"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
+        ) == 0
     except Exception:
         return False
 
@@ -170,7 +169,7 @@ def connect_pymysql(db_cfg: dict, dict_cursor=False):
         kwargs["cursorclass"] = pymysql.cursors.DictCursor
     return pymysql.connect(**kwargs)
 
-# -------------------- Yellow internet behavior (exact like old) --------------------
+# -------------------- Yellow internet behavior --------------------
 yellow_checker_timer = None
 
 def update_yellow_light():
@@ -182,43 +181,38 @@ def update_yellow_light():
         pass
 
     if check_internet():
-        yellow(True)  # solid ON
-    else:
-        # blink once (0.5s ON) every 10 seconds
         yellow(True)
-        time.sleep(0.5)
-        yellow(False)
+    else:
+        yellow(True); time.sleep(0.5); yellow(False)
 
     yellow_checker_timer = threading.Timer(10, update_yellow_light)
     yellow_checker_timer.daemon = True
     yellow_checker_timer.start()
 
-# -------------------- Green blinking state machine (exact) --------------------
+# -------------------- Green blinking state machine --------------------
 green_blink_running = True
 green_blink_thread = None
-green_mode = "BLINK"  # "BLINK" or "SOLID"
+green_mode = "BLINK"  # BLINK or SOLID
 
 def continuous_green_blink():
     global green_blink_running, green_mode
-    # Fast blink 5 times at boot/RESET restart (0.2 ON / 0.1 OFF)
+    # fast blink 5 times
     for _ in range(5):
         if not green_blink_running or green_mode != "BLINK":
             break
         green(True); time.sleep(0.2)
         green(False); time.sleep(0.1)
 
-    # Slow blink until stopped (0.5/0.5)
+    # slow blink
     while green_blink_running and green_mode == "BLINK":
         green(True); time.sleep(0.5)
         green(False); time.sleep(0.5)
 
-    # Ensure OFF if thread ends in blink mode; if SOLID set elsewhere, it stays ON.
     if green_mode == "BLINK":
         green(False)
 
 def restart_green_blink():
     global green_blink_running, green_blink_thread, green_mode
-    # stop existing
     green_blink_running = False
     if green_blink_thread and green_blink_thread.is_alive():
         green_blink_thread.join(timeout=1.0)
@@ -226,7 +220,6 @@ def restart_green_blink():
     green(False)
     green_mode = "BLINK"
     green_blink_running = True
-
     green_blink_thread = threading.Thread(target=continuous_green_blink, daemon=True)
     green_blink_thread.start()
     debug("✅ Green blinking restarted")
@@ -240,60 +233,49 @@ def set_green_solid_on():
     green(True)
     debug("✅ Green solid ON")
 
-# -------------------- Red + buzzer persistent alerts (exact like old) --------------------
-red_alert_active = False
-buzzer_alert_active = False
-red_alert_thread = None
-buzzer_alert_thread = None
+# -------------------- ERROR ALERT (FIXED) --------------------
+# Persistent threads + Event => no race condition
+error_event = threading.Event()
 
-def continuous_red_blink():
-    global red_alert_active
-    while red_alert_active:
-        red(True); time.sleep(0.5)
-        red(False); time.sleep(0.5)
+def red_alert_worker():
+    # runs forever
+    while True:
+        if error_event.is_set():
+            red(True); time.sleep(0.5)
+            red(False); time.sleep(0.5)
+        else:
+            red(False)
+            time.sleep(0.1)
+
+def buzzer_alert_worker():
+    # runs forever
+    while True:
+        if error_event.is_set():
+            # USER REQUIREMENT: buzzer continuous ON during error
+            buzzer(True)
+            time.sleep(0.1)
+        else:
+            buzzer(False)
+            time.sleep(0.1)
+
+# start persistent workers once
+threading.Thread(target=red_alert_worker, daemon=True).start()
+threading.Thread(target=buzzer_alert_worker, daemon=True).start()
+
+def start_error_alert():
+    error_event.set()
+
+def stop_error_alert():
+    error_event.clear()
     red(False)
-
-def continuous_buzz():
-    global buzzer_alert_active
-    while buzzer_alert_active:
-        buzzer(True); time.sleep(0.15)
-        buzzer(False); time.sleep(0.5)
     buzzer(False)
 
-def stop_all_alerts():
-    global red_alert_active, buzzer_alert_active, red_alert_thread, buzzer_alert_thread
-    red_alert_active = False
-    buzzer_alert_active = False
-
-    if red_alert_thread and red_alert_thread.is_alive():
-        red_alert_thread.join(timeout=0.6)
-    red(False)
-
-    if buzzer_alert_thread and buzzer_alert_thread.is_alive():
-        buzzer_alert_thread.join(timeout=0.6)
-    buzzer(False)
-
-def start_red_buzzer_alert():
-    global red_alert_active, buzzer_alert_active, red_alert_thread, buzzer_alert_thread
-    red_alert_active = True
-    buzzer_alert_active = True
-
-    if not (red_alert_thread and red_alert_thread.is_alive()):
-        red_alert_thread = threading.Thread(target=continuous_red_blink, daemon=True)
-        red_alert_thread.start()
-    if not (buzzer_alert_thread and buzzer_alert_thread.is_alive()):
-        buzzer_alert_thread = threading.Thread(target=continuous_buzz, daemon=True)
-        buzzer_alert_thread.start()
-
-# -------------------- Staff validation (match your old intent) --------------------
+# -------------------- Staff functions (perfect flow) --------------------
 def resolve_image_url(path):
     path = (path or "").strip().lstrip("../")
     return f"http://192.168.20.17/{path}"
 
 def is_valid_staff_id(staff_id: str) -> bool:
-    """
-    Old perfect code: pull staff_list where staffpos='OPERATOR' and validate.
-    """
     try:
         conn = mysql.connector.connect(
             host=STAFF_DB["host"],
@@ -310,12 +292,9 @@ def is_valid_staff_id(staff_id: str) -> bool:
         debug(f"Staff DB connection error: {e}")
         return False
 
+staff_id = None
+
 def staff_in_out_flow(staff_code: str):
-    """
-    Replicates your old 'perfect' staff IN/OUT logic:
-    - first scan sets IN and writes allocation_temp, allcation_log, prod_attendance
-    - scanning same staff again sets OUT and clears session
-    """
     global staff_id
     staff_code = normalize_barcode(staff_code)
 
@@ -333,24 +312,21 @@ def staff_in_out_flow(staff_code: str):
         if staff_id is None:
             if not is_valid_staff_id(staff_code):
                 debug(f"Invalid staff ID: {staff_code}")
-                start_red_buzzer_alert()
+                start_error_alert()
                 return
 
             staff_id = staff_code
-            debug(f"✅ Valid staff ID detected: {staff_id}")
-
             cur.execute("SELECT * FROM staff_list WHERE staffid=%s", (staff_id,))
             staff_row = cur.fetchone()
             if not staff_row:
-                debug("❌ Staff ID not found in DB after validation")
-                start_red_buzzer_alert()
+                debug("❌ Staff not found after validation")
                 staff_id = None
+                start_error_alert()
                 return
 
             shift = (staff_row.get("shift") or "").upper()
             shift_value = "DAY" if "DAY" in shift else "NIGHT" if "NIGHT" in shift else ""
 
-            # allocation_temp
             cur.execute("DELETE FROM allocation_temp WHERE staffid=%s", (staff_id,))
             cur.execute("""
                 INSERT INTO allocation_temp
@@ -363,7 +339,6 @@ def staff_in_out_flow(staff_code: str):
                 now_dt.date(), resolve_image_url(staff_row.get("pic"))
             ))
 
-            # allcation_log (spelling as in your old code)
             cur.execute("SELECT id FROM allcation_log WHERE employee_id=%s AND date_run=%s", (staff_id, today_str))
             log_row = cur.fetchone()
             if log_row:
@@ -383,7 +358,6 @@ def staff_in_out_flow(staff_code: str):
                     today_str, now_dt, shift_value
                 ))
 
-            # prod_attendance
             cur.execute("SELECT id FROM prod_attendance WHERE staffid=%s AND date=%s", (staff_id, today_str))
             att_row = cur.fetchone()
             if att_row:
@@ -405,11 +379,10 @@ def staff_in_out_flow(staff_code: str):
                 ))
 
             conn.commit()
-            debug("✅ Staff IN logic complete")
+            debug("✅ Staff IN complete")
 
         elif staff_code == staff_id:
-            debug(f"🔁 OUT scan for {staff_id}, clearing session")
-
+            debug(f"🔁 Staff OUT: {staff_id}")
             cur.execute("SELECT id FROM allcation_log WHERE employee_id=%s AND date_run=%s", (staff_id, today_str))
             row = cur.fetchone()
             if row:
@@ -423,12 +396,11 @@ def staff_in_out_flow(staff_code: str):
             conn.commit()
             staff_id = None
 
-        cur.close()
-        conn.close()
+        cur.close(); conn.close()
 
     except Exception as e:
-        debug(f"🔥 Error during staff ID scan: {e}")
-        start_red_buzzer_alert()
+        debug(f"🔥 Staff flow error: {e}")
+        start_error_alert()
 
 # -------------------- Production DB operations --------------------
 def fetch_muf_info(muf_code: str):
@@ -444,7 +416,7 @@ def fetch_muf_info(muf_code: str):
         debug(f"⚠️ Production DB error: {e}")
         return None
 
-# -------------------- CSV caching & upload (fixed) --------------------
+# -------------------- CSV + output_log insert --------------------
 csv_lock = threading.Lock()
 
 CSV_HEADER = [
@@ -470,7 +442,7 @@ def write_to_csv(data_11, muf_no: str, uploaded=0, remarks=""):
                 if is_new:
                     w.writerow(CSV_HEADER)
                 w.writerow(list(data_11) + [remarks, int(uploaded)])
-            debug(f"📂 Written to CSV: {path} (uploaded={uploaded})")
+            debug(f"📂 CSV saved: {path} (uploaded={uploaded})")
         except Exception as e:
             debug(f"⚠️ CSV write failed: {path} ({e})")
 
@@ -491,6 +463,15 @@ def insert_output_log(data_11, remarks: str) -> bool:
     except Exception as e:
         debug(f"⚠️ DB insert failed: {e}")
         return False
+
+# main scan state
+current_batch = None
+current_muf = None
+template_code = None
+muf_info = None
+barcode_buffer = ""
+last_scan_time = 0.0
+last_barcode = None
 
 def process_and_store(carton_barcode: str, muf_info: dict, remarks="SCAN"):
     pack_per_ctn = safe_int(muf_info.get("pack_per_ctn"))
@@ -517,10 +498,8 @@ def process_and_store(carton_barcode: str, muf_info: dict, remarks="SCAN"):
 
     ok = insert_output_log(data_11, remarks=remarks)
     if ok:
-        debug("✅ DB insert successful")
         write_to_csv(data_11, current_muf, uploaded=1, remarks=remarks)
     else:
-        debug("⚠️ DB insert failed. Cached locally.")
         write_to_csv(data_11, current_muf, uploaded=0, remarks=remarks)
 
 def upload_from_csv():
@@ -528,7 +507,6 @@ def upload_from_csv():
         debug("⏫ Attempting to upload cached CSV data...")
 
         if not os.path.isdir(CSV_FOLDER):
-            debug(f"⚠️ CSV folder not found: {CSV_FOLDER}")
             return
 
         for file in os.listdir(CSV_FOLDER):
@@ -537,14 +515,14 @@ def upload_from_csv():
 
             path = os.path.join(CSV_FOLDER, file)
 
-            # Remove 0-byte file (fix your old crash loop)
+            # remove 0-byte files
             try:
                 if os.path.getsize(path) == 0:
-                    debug(f"🧹 Empty (0-byte) CSV found, removing: {path}")
+                    debug(f"🧹 Removing 0-byte CSV: {path}")
                     try:
                         os.remove(path)
-                    except Exception as e:
-                        debug(f"⚠️ Cannot remove empty CSV: {path} ({e})")
+                    except Exception:
+                        pass
                     continue
             except Exception:
                 continue
@@ -553,18 +531,15 @@ def upload_from_csv():
                 try:
                     with open(path, "r", newline="") as f:
                         rows = list(csv.reader(f))
-                except Exception as e:
-                    debug(f"⚠️ Cannot read CSV: {path} ({e})")
+                except Exception:
                     continue
 
             if len(rows) <= 1:
-                debug(f"ℹ️ Skip CSV (empty/header-only): {path}")
                 continue
 
             pending_idx = []
             pending_vals = []
-            data_rows = rows[1:]
-            for idx, r in enumerate(data_rows, start=1):
+            for idx, r in enumerate(rows[1:], start=1):
                 if len(r) < 13:
                     continue
                 if r[-1] == "0":
@@ -573,8 +548,6 @@ def upload_from_csv():
 
             if not pending_vals:
                 continue
-
-            debug(f"⏫ Pending rows: {len(pending_vals)} in {path}")
 
             try:
                 conn = connect_pymysql(PRODUCTION_DB, dict_cursor=False)
@@ -598,10 +571,8 @@ def upload_from_csv():
                         with open(path, "w", newline="") as f:
                             w = csv.writer(f)
                             w.writerows(rows)
-                    except Exception as e:
-                        debug(f"⚠️ Failed to mark uploaded in CSV: {path} ({e})")
-
-                debug(f"✅ Upload complete and marked: {path}")
+                    except Exception:
+                        pass
 
             except Exception as e:
                 debug(f"⚠️ Upload failed: {e}")
@@ -609,19 +580,10 @@ def upload_from_csv():
     finally:
         threading.Timer(UPLOAD_INTERVAL_SEC, upload_from_csv).start()
 
-# -------------------- Main scanning state --------------------
-current_batch = None
-current_muf = None
-template_code = None
-muf_info = None
-barcode_buffer = ""
-last_scan_time = 0.0
-last_barcode = None
-staff_id = None
-
+# -------------------- Keyboard handler --------------------
 def on_key(event):
     global barcode_buffer, last_barcode, last_scan_time
-    global current_batch, current_muf, template_code, muf_info, staff_id
+    global current_batch, current_muf, template_code, muf_info
 
     if event.name == "enter":
         barcode = barcode_buffer.strip()
@@ -638,10 +600,10 @@ def on_key(event):
 
         last_barcode = barcode
         last_scan_time = now_ts
-        debug(f"📥 Scanned barcode: '{barcode}' → normalized: '{normalized}'")
+        debug(f"📥 Scanned: '{barcode}' -> '{normalized}'")
 
-        # IMPORTANT: stop alerts on ANY scan (matches your perfect flow)
-        stop_all_alerts()
+        # Stop ANY active alerts on ANY scan (perfect behavior)
+        stop_error_alert()
 
         now = datetime.now()
 
@@ -652,22 +614,18 @@ def on_key(event):
             current_muf = None
             template_code = None
             muf_info = None
-
-            # Restart green blink (fast then slow)
             restart_green_blink()
             return
 
-        # Staff ID
+        # Staff
         if looks_like_staff_id(normalized):
             staff_in_out_flow(normalized)
-            # On valid staff actions, brief green feedback is not needed because green is already blinking/solid;
-            # Your old code did a single blink + buzz; we keep the alert system logic and keep green state.
             return
 
-        # Must scan RESET first
+        # Must RESET first
         if not current_batch:
             debug("⚠️ Please scan RESET first.")
-            start_red_buzzer_alert()
+            start_error_alert()
             return
 
         # MUF stage
@@ -677,38 +635,32 @@ def on_key(event):
                 current_muf = normalized
                 muf_info = info
                 debug(f"✅ MUF found: {current_muf}")
-                # Green stays blinking (no change):contentReference[oaicite:2]{index=2}
             else:
                 debug(f"❌ MUF not found: {normalized}")
-                start_red_buzzer_alert()
+                start_error_alert()
             return
 
         # Template stage
         if template_code is None:
             if normalized == current_muf:
                 debug("⚠️ MUF scanned again as template (invalid)")
-                start_red_buzzer_alert()
+                start_error_alert()
                 return
-
             template_code = normalized
-            debug(f"🧾 Template barcode set: {template_code}")
-
-            # Stop blinking and set green solid ON (exact behavior):contentReference[oaicite:3]{index=3}
+            debug(f"🧾 Template set: {template_code}")
             set_green_solid_on()
-
             process_and_store(template_code, muf_info, remarks="TEMPLATE")
             return
 
-        # After template: mismatch => persistent error
+        # After template: mismatch
         if normalized != template_code:
             debug(f"❌ Barcode mismatch: {normalized} != {template_code}")
-            start_red_buzzer_alert()
+            start_error_alert()
             return
 
-        # Match template => store
+        # Match template
         debug(f"✅ Barcode matches template: {template_code}")
         process_and_store(template_code, muf_info, remarks="SCAN")
-        # Green stays solid ON:contentReference[oaicite:4]{index=4}
 
     elif len(event.name) == 1:
         barcode_buffer += event.name
@@ -720,15 +672,9 @@ if __name__ == "__main__":
     debug(f"🔌 GPIO initialized. ACTIVE_LOW={ACTIVE_LOW}, CHANNEL_ACTIVE_LOW={CHANNEL_ACTIVE_LOW}")
     tower_all_off()
 
-    # Start yellow internet status checker (exact behavior):contentReference[oaicite:5]{index=5}
     update_yellow_light()
-
-    # Start periodic CSV upload
     upload_from_csv()
-
-    # Start initial green blinking (boot behavior):contentReference[oaicite:6]{index=6}
     restart_green_blink()
-    debug("Initial green light blinking started.")
 
     debug("🧭 Listening for barcode scan via keyboard...")
     keyboard.on_press(on_key)
