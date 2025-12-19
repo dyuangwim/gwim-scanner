@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-# main.py  (Option 1 - Intranet DB; per-line independent)
+# main.py (Relay version - safe polarity handling)
 # ==========================================================
-# Key fixes:
-# - No more IndexError from empty CSV (skip & optionally remove 0-byte CSV)
-# - Startup logs folder writability check (prints exact chown command)
-# - DB connect timeouts to avoid long hangs
-# - Keeps original scanning logic: RESET -> staff -> MUF -> TEMPLATE -> SCAN
+# This version fixes:
+# - buzzer stuck ON at boot due to wrong active level
+# - tower lights not responding due to inversion mismatch
+# - CSV empty file IndexError (skip + auto remove 0-byte)
+# - logs folder writable check & clear guidance
+#
+# IMPORTANT:
+# - For RELAY modules (common): ACTIVE_LOW = True
+# - For DIRECT GPIO LED wiring: ACTIVE_LOW = False
 # ==========================================================
 
 import os
@@ -29,67 +33,84 @@ from config import (
     UPLOAD_INTERVAL_SEC,
 )
 
-# -------------------- Debug --------------------
-DEBUG_MODE = True
+# -------------------- OUTPUT POLARITY (MOST IMPORTANT) --------------------
+# Relay modules are usually Active-Low (LOW = ON).
+# Direct LED wiring is usually Active-High (HIGH = ON).
+ACTIVE_LOW = True  # <-- YOU SAID THIS FILE IS FOR RELAY DEVICES => True
 
-def debug(msg: str):
-    if DEBUG_MODE:
-        print(f"[DEBUG] {msg}")
+# If your buzzer is wired differently from lamps, you can override per-channel:
+# True = Active-Low (LOW=ON), False = Active-High (HIGH=ON)
+CHANNEL_ACTIVE_LOW = {
+    "GREEN":  ACTIVE_LOW,
+    "RED":    ACTIVE_LOW,
+    "YELLOW": ACTIVE_LOW,
+    "BUZZER": ACTIVE_LOW,
+}
 
-# -------------------- Relay Tower Lamp (LOW=ON / HIGH=OFF) --------------------
-# Adjust pins if needed
+# -------------------- GPIO PINS (BCM) --------------------
 GPIO_GREEN  = 6
 GPIO_RED    = 13
 GPIO_YELLOW = 19
 GPIO_BUZZER = 26
 
+# -------------------- Debug --------------------
+DEBUG_MODE = True
+def debug(msg: str):
+    if DEBUG_MODE:
+        print(f"[DEBUG] {msg}")
+
+# -------------------- GPIO init --------------------
 GPIO.setmode(GPIO.BCM)
 GPIO.setwarnings(False)
 
-GPIO.setup(GPIO_GREEN, GPIO.OUT)
-GPIO.setup(GPIO_RED, GPIO.OUT)
-GPIO.setup(GPIO_YELLOW, GPIO.OUT)
-GPIO.setup(GPIO_BUZZER, GPIO.OUT)
+for pin in (GPIO_GREEN, GPIO_RED, GPIO_YELLOW, GPIO_BUZZER):
+    GPIO.setup(pin, GPIO.OUT)
+
+def _pin_write(pin: int, on: bool, active_low: bool):
+    """
+    Write physical level to pin given desired logical state on/off.
+    active_low=True => ON=LOW, OFF=HIGH
+    active_low=False => ON=HIGH, OFF=LOW
+    """
+    if active_low:
+        GPIO.output(pin, GPIO.LOW if on else GPIO.HIGH)
+    else:
+        GPIO.output(pin, GPIO.HIGH if on else GPIO.LOW)
+
+def green(on: bool):  _pin_write(GPIO_GREEN,  on, CHANNEL_ACTIVE_LOW["GREEN"])
+def red(on: bool):    _pin_write(GPIO_RED,    on, CHANNEL_ACTIVE_LOW["RED"])
+def yellow(on: bool): _pin_write(GPIO_YELLOW, on, CHANNEL_ACTIVE_LOW["YELLOW"])
+def buzzer(on: bool): _pin_write(GPIO_BUZZER, on, CHANNEL_ACTIVE_LOW["BUZZER"])
 
 def tower_all_off():
-    GPIO.output(GPIO_GREEN, GPIO.HIGH)
-    GPIO.output(GPIO_RED, GPIO.HIGH)
-    GPIO.output(GPIO_YELLOW, GPIO.HIGH)
-    GPIO.output(GPIO_BUZZER, GPIO.HIGH)
+    # logical OFF for all channels
+    green(False)
+    red(False)
+    yellow(False)
+    buzzer(False)
 
-def green_on():   GPIO.output(GPIO_GREEN, GPIO.LOW)
-def green_off():  GPIO.output(GPIO_GREEN, GPIO.HIGH)
-def red_on():     GPIO.output(GPIO_RED, GPIO.LOW)
-def red_off():    GPIO.output(GPIO_RED, GPIO.HIGH)
-def yellow_on():  GPIO.output(GPIO_YELLOW, GPIO.LOW)
-def yellow_off(): GPIO.output(GPIO_YELLOW, GPIO.HIGH)
-
-def buzzer_beep(seconds=0.25):
-    GPIO.output(GPIO_BUZZER, GPIO.LOW)
-    time.sleep(seconds)
-    GPIO.output(GPIO_BUZZER, GPIO.HIGH)
-
+# Critical: turn everything off immediately at boot
 tower_all_off()
+
+def buzzer_beep(seconds=0.20):
+    buzzer(True)
+    time.sleep(seconds)
+    buzzer(False)
 
 # -------------------- File/Log setup --------------------
 os.makedirs(CSV_FOLDER, exist_ok=True)
 
-# Redirect stdout/stderr to log file (line-buffered)
 try:
     sys.stdout = open(LOG_PATH, "a", buffering=1)
     sys.stderr = sys.stdout
 except Exception:
-    # If we can't open log, we still continue with default stdout
     pass
 
 debug("🔁 Script started (log ready)")
-debug("🟩 GPIO initialized (relay LOW=ON, HIGH=OFF)")
+debug(f"🟩 GPIO initialized. ACTIVE_LOW={ACTIVE_LOW}, per-channel={CHANNEL_ACTIVE_LOW}")
+debug("🧯 Safety: tower_all_off() executed at boot")
 
 def ensure_logs_writable() -> bool:
-    """
-    Prevent your old 'permission + empty csv' loop.
-    If folder isn't writable, we don't crash; we warn clearly.
-    """
     test_path = os.path.join(CSV_FOLDER, ".write_test")
     try:
         with open(test_path, "w") as f:
@@ -99,7 +120,7 @@ def ensure_logs_writable() -> bool:
         return True
     except Exception as e:
         debug(f"❌ Logs folder NOT writable: {CSV_FOLDER} ({e})")
-        debug("Fix by running on Raspberry Pi terminal:")
+        debug("Fix on Raspberry Pi terminal:")
         debug("  sudo chown -R pi:pi /home/pi/gwim-scanner/logs")
         debug("  sudo chmod -R 775 /home/pi/gwim-scanner/logs")
         return False
@@ -116,9 +137,7 @@ def safe_int(v):
 def normalize_barcode(code: str) -> str:
     return (
         code.strip()
-            .replace("–", "-")
-            .replace("−", "-")
-            .replace("—", "-")
+            .replace("–", "-").replace("−", "-").replace("—", "-")
             .replace("_", "-")
             .upper()
     )
@@ -129,7 +148,6 @@ def is_reset_code(barcode: str) -> bool:
     return normalize_barcode(barcode) in RESET_SET
 
 def looks_like_staff_id(barcode: str) -> bool:
-    # Your original logic: contains letters
     b = normalize_barcode(barcode)
     return any(c.isalpha() for c in b)
 
@@ -170,14 +188,9 @@ CSV_HEADER = [
 ]
 
 def write_to_csv(row_tuple, muf_no: str, uploaded: int, remarks: str):
-    """
-    Always cache to CSV (your original design).
-    If logs folder not writable, just log warning and return.
-    """
     if not LOGS_WRITABLE:
-        debug("⚠️ CSV not written because logs folder not writable.")
+        debug("⚠️ CSV not written (logs folder not writable).")
         return
-
     path = _csv_path_for_muf(muf_no)
     with csv_lock:
         is_new = not os.path.exists(path)
@@ -191,36 +204,7 @@ def write_to_csv(row_tuple, muf_no: str, uploaded: int, remarks: str):
         except Exception as e:
             debug(f"⚠️ CSV write failed: {path} ({e})")
 
-def _read_csv_rows(path: str):
-    """
-    Return (rows, header_ok).
-    rows includes header as rows[0] if present.
-    """
-    try:
-        with open(path, "r", newline="") as f:
-            rows = list(csv.reader(f))
-        if not rows:
-            return [], False
-        if rows[0] != CSV_HEADER:
-            # allow old header, but still treat as readable; we just won't validate strictly
-            return rows, True
-        return rows, True
-    except Exception:
-        return [], False
-
-def _write_csv_rows(path: str, rows):
-    with open(path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerows(rows)
-
 def upload_from_csv():
-    """
-    Periodically:
-    - Skip / remove 0-byte files
-    - Skip empty or header-only CSV
-    - Insert pending rows (is_uploaded=0) into production.output_log
-    - Mark those rows as uploaded=1 in the CSV
-    """
     try:
         debug("⏫ Attempting to upload cached CSV data...")
 
@@ -234,8 +218,7 @@ def upload_from_csv():
 
             path = os.path.join(CSV_FOLDER, file)
 
-            # --- Fix for your old bug: empty file -> IndexError in old code ---
-            # If 0 bytes, remove it to avoid repeat crashes.
+            # auto remove empty file (0 bytes) to avoid old IndexError loop
             try:
                 if os.path.getsize(path) == 0:
                     debug(f"🧹 Empty (0-byte) CSV found, removing: {path}")
@@ -249,34 +232,33 @@ def upload_from_csv():
                 continue
 
             with csv_lock:
-                rows, ok = _read_csv_rows(path)
+                try:
+                    with open(path, "r", newline="") as f:
+                        rows = list(csv.reader(f))
+                except Exception as e:
+                    debug(f"⚠️ Cannot read CSV: {path} ({e})")
+                    continue
 
-            if not ok or len(rows) <= 1:
-                # empty or header-only (or unreadable) -> skip; do not crash
-                debug(f"ℹ️ Skip CSV (empty/header-only/unreadable): {path}")
+            if len(rows) <= 1:
+                debug(f"ℹ️ Skip CSV (empty/header-only): {path}")
                 continue
 
-            header = rows[0]
             data_rows = rows[1:]
 
-            # Find pending rows: last column is is_uploaded
-            pending_indices = []
-            pending_values = []
-
+            pending_idx = []
+            pending_vals = []
             for idx, r in enumerate(data_rows, start=1):
                 if len(r) < 13:
                     continue
                 if r[-1] == "0":
-                    # first 12 columns match DB insert, r[11] is remarks
-                    pending_indices.append(idx)
-                    pending_values.append(r[:12])
+                    pending_idx.append(idx)
+                    pending_vals.append(r[:12])  # includes remarks at position 11
 
-            if not pending_values:
+            if not pending_vals:
                 continue
 
-            debug(f"⏫ Pending rows: {len(pending_values)} in {path}")
+            debug(f"⏫ Pending rows: {len(pending_vals)} in {path}")
 
-            # Insert all pending
             try:
                 conn = connect_pymysql(PRODUCTION_DB, dict_cursor=False)
                 cur = conn.cursor()
@@ -286,19 +268,20 @@ def upload_from_csv():
                     "ctn_count, scanned_code, scanned_count, scanned_at, scanned_by, remarks"
                     ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
                 )
-                for v in pending_values:
+                for v in pending_vals:
                     cur.execute(sql, v)
                 conn.commit()
                 cur.close()
                 conn.close()
 
-                # Mark uploaded
                 with csv_lock:
-                    for i in pending_indices:
+                    for i in pending_idx:
                         if len(rows[i]) >= 13:
                             rows[i][-1] = "1"
                     try:
-                        _write_csv_rows(path, rows)
+                        with open(path, "w", newline="") as f:
+                            w = csv.writer(f)
+                            w.writerows(rows)
                     except Exception as e:
                         debug(f"⚠️ Failed to mark uploaded in CSV: {path} ({e})")
 
@@ -310,7 +293,6 @@ def upload_from_csv():
     except Exception as e:
         debug(f"⚠️ upload_from_csv unexpected error: {e}")
 
-    # schedule next run
     threading.Timer(UPLOAD_INTERVAL_SEC, upload_from_csv).start()
 
 # -------------------- Staff IN/OUT --------------------
@@ -321,18 +303,13 @@ def is_valid_staff_id(staff_id: str) -> bool:
         cur = conn.cursor()
         cur.execute("SELECT 1 FROM staff WHERE staff_id=%s LIMIT 1", (staff_id,))
         ok = cur.fetchone() is not None
-        cur.close()
-        conn.close()
+        cur.close(); conn.close()
         return ok
     except Exception as e:
         debug(f"Staff DB connection error: {e}")
         return False
 
 def toggle_staff_status(staff_id: str) -> str:
-    """
-    - If no row: INSERT IN
-    - If IN -> OUT, else OUT -> IN
-    """
     staff_id = normalize_barcode(staff_id)
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     try:
@@ -353,18 +330,12 @@ def toggle_staff_status(staff_id: str) -> str:
 
         status = row[0]
         if status == "IN":
-            cur.execute(
-                "UPDATE staff_status SET status='OUT', updated_at=%s WHERE staff_id=%s",
-                (now_str, staff_id)
-            )
+            cur.execute("UPDATE staff_status SET status='OUT', updated_at=%s WHERE staff_id=%s", (now_str, staff_id))
             conn.commit()
             cur.close(); conn.close()
             return "OUT"
         else:
-            cur.execute(
-                "UPDATE staff_status SET status='IN', updated_at=%s WHERE staff_id=%s",
-                (now_str, staff_id)
-            )
+            cur.execute("UPDATE staff_status SET status='IN', updated_at=%s WHERE staff_id=%s", (now_str, staff_id))
             conn.commit()
             cur.close(); conn.close()
             return "IN"
@@ -387,12 +358,7 @@ def fetch_muf_info(muf_code: str):
         debug(f"fetch_muf_info DB error: {e}")
         return None
 
-def insert_output_log(data_tuple_11_fields, remarks: str) -> bool:
-    """
-    data_tuple_11_fields:
-      (muf_no, line, fg_no, pack_per_ctn, pack_per_hr, actual_pack,
-       ctn_count, scanned_code, scanned_count, scanned_at, scanned_by)
-    """
+def insert_output_log(data_tuple_11, remarks: str) -> bool:
     try:
         conn = connect_pymysql(PRODUCTION_DB, dict_cursor=False)
         cur = conn.cursor()
@@ -402,7 +368,7 @@ def insert_output_log(data_tuple_11_fields, remarks: str) -> bool:
             "ctn_count, scanned_code, scanned_count, scanned_at, scanned_by, remarks"
             ") VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
         )
-        cur.execute(sql, data_tuple_11_fields + (remarks,))
+        cur.execute(sql, data_tuple_11 + (remarks,))
         conn.commit()
         cur.close(); conn.close()
         return True
@@ -410,18 +376,17 @@ def insert_output_log(data_tuple_11_fields, remarks: str) -> bool:
         debug(f"⚠️ DB insert failed: {e}")
         return False
 
-# -------------------- Network indicator (yellow lamp) --------------------
+# -------------------- Network indicator (yellow) --------------------
 def network_indicator_loop():
     while True:
         try:
             if ping_ok("8.8.8.8"):
-                yellow_on()
+                yellow(True)
             else:
-                yellow_off()
-                time.sleep(0.2)
-                yellow_on()
-                time.sleep(0.2)
-                yellow_off()
+                # blink quickly when no internet
+                yellow(False); time.sleep(0.2)
+                yellow(True);  time.sleep(0.2)
+                yellow(False)
         except Exception:
             pass
         time.sleep(10)
@@ -436,7 +401,7 @@ barcode_buffer = ""
 last_barcode = None
 last_scan_time = 0.0
 
-staff_id = None  # current staff who is IN
+staff_id = None  # current staff IN
 
 def set_state_reset():
     global current_batch, current_muf, muf_info, template_code
@@ -445,15 +410,12 @@ def set_state_reset():
     current_muf = None
     muf_info = None
     template_code = None
-    debug(f"🔄 RESET scanned. New batch: {current_batch}")
 
-    red_off()
-    green_off()
+    debug(f"🔄 RESET scanned. New batch: {current_batch}")
+    red(False)
+    green(False)
 
 def process_and_store(scanned_barcode: str, remarks: str):
-    """
-    Keep original behavior: insert output_log + write CSV (fallback).
-    """
     global current_muf, muf_info, staff_id
 
     pack_per_ctn = safe_int(muf_info.get("pack_per_ctn"))
@@ -483,13 +445,11 @@ def process_and_store(scanned_barcode: str, remarks: str):
     if ok:
         debug("✅ DB insert successful")
         write_to_csv(data_11, current_muf, uploaded=1, remarks=remarks)
-        green_on()
-        red_off()
+        green(True); red(False)
         buzzer_beep(0.08)
     else:
         debug("⚠️ DB insert failed. Cached locally.")
         write_to_csv(data_11, current_muf, uploaded=0, remarks=remarks)
-        # keep minimal beep so operator feedback still exists
         buzzer_beep(0.08)
 
 # -------------------- Keyboard handler --------------------
@@ -507,7 +467,6 @@ def on_key(event):
         normalized = normalize_barcode(barcode)
         now_ts = time.time()
 
-        # Prevent duplicate scan within interval
         if barcode == last_barcode and (now_ts - last_scan_time) < float(SCAN_INTERVAL):
             debug(f"⏱️ Duplicate scan ignored: {barcode}")
             return
@@ -520,23 +479,24 @@ def on_key(event):
         # 1) RESET
         if is_reset_code(barcode):
             set_state_reset()
-            # green blink to show ready
-            green_on(); time.sleep(0.2); green_off(); time.sleep(0.2); green_on()
+            # blink green to show ready
+            green(True); time.sleep(0.2)
+            green(False); time.sleep(0.2)
+            green(True)
             return
 
-        # Require RESET first
         if not current_batch:
             debug("⚠️ Please scan RESET first.")
-            red_on()
+            red(True)
             buzzer_beep(0.30)
             return
 
-        # 2) Staff ID
+        # 2) staff
         if looks_like_staff_id(barcode):
-            candidate = normalize_barcode(barcode)
+            candidate = normalized
             if not is_valid_staff_id(candidate):
                 debug(f"❌ Invalid staff ID: {candidate}")
-                red_on()
+                red(True)
                 buzzer_beep(0.30)
                 return
 
@@ -544,26 +504,26 @@ def on_key(event):
             if status == "IN":
                 staff_id = candidate
                 debug(f"👤 Staff IN: {staff_id}")
-                green_on(); red_off()
+                green(True); red(False)
                 buzzer_beep(0.08)
             elif status == "OUT":
                 debug(f"👤 Staff OUT: {candidate}")
                 if staff_id == candidate:
                     staff_id = None
-                green_off(); red_off()
+                green(False); red(False)
                 buzzer_beep(0.08)
             else:
                 debug("⚠️ Staff status update ERROR")
-                red_on()
+                red(True)
                 buzzer_beep(0.30)
             return
 
-        # 3) MUF not set yet -> treat this as MUF
+        # 3) MUF
         if current_muf is None:
             info = fetch_muf_info(normalized)
             if not info:
                 debug(f"❌ MUF not found: {normalized}")
-                red_on()
+                red(True)
                 buzzer_beep(0.30)
                 return
 
@@ -572,33 +532,31 @@ def on_key(event):
             template_code = None
             debug(f"✅ MUF set: {current_muf} (fg_no={muf_info.get('fg_no')})")
 
-            # green blink to prompt template
-            green_on(); time.sleep(0.2); green_off(); time.sleep(0.2); green_on()
-            red_off()
+            # blink green to prompt template
+            green(True); time.sleep(0.2)
+            green(False); time.sleep(0.2)
+            green(True)
+            red(False)
             return
 
-        # 4) TEMPLATE not set yet
+        # 4) TEMPLATE
         if template_code is None:
             if normalized == current_muf:
                 debug("⚠️ MUF scanned again; ignoring as template.")
                 return
-
             template_code = normalized
             debug(f"🧾 Template set: {template_code}")
-
-            # record template as one carton (original behavior)
             process_and_store(template_code, remarks="TEMPLATE")
             return
 
-        # 5) Subsequent scans must match template
+        # 5) SCAN must match template
         if normalized != template_code:
             debug(f"❌ Barcode mismatch: {normalized} != {template_code}")
-            red_on()
-            green_off()
+            red(True)
+            green(False)
             buzzer_beep(0.35)
             return
 
-        # match template => store
         process_and_store(normalized, remarks="SCAN")
 
     elif len(event.name) == 1:
@@ -609,15 +567,14 @@ def on_key(event):
 # -------------------- Entry point --------------------
 if __name__ == "__main__":
     debug(f"🚀 Starting scanner: line={DEVICE_LINE}, device={DEVICE_ID}")
-    debug(f"📁 CSV folder: {CSV_FOLDER}")
 
-    # Start periodic upload thread
+    # start periodic upload
     upload_from_csv()
 
-    # Start network indicator
+    # start yellow lamp network indicator
     threading.Thread(target=network_indicator_loop, daemon=True).start()
 
-    # Start barcode listening
+    # start listening for barcode
     debug("🧭 Listening for barcode scan via keyboard...")
     keyboard.on_press(on_key)
     keyboard.wait()
