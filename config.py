@@ -5,11 +5,12 @@
 # ============================================================
 
 # ---------- Production DB (for MUF lookup + output_log insert) ----------
+# ---------- Production DB (Cloud) ----------
 PRODUCTION_DB = {
-    "host": "192.168.20.17",      # <-- intranet DB
-    "port": 3306,
-    "user": "itadmin",            # <-- change to the correct DB user
-    "password": "itadmin@2018",   # <-- change to the correct DB password
+    "host": "149.28.152.191",
+    "port": 23306,                 
+    "user": "admin",
+    "password": "QhGhXaAhp9PunJz9",
     "database": "production",
 }
 
@@ -41,3 +42,4 @@ DB_WRITE_TIMEOUT = 5
 
 # ---------- Upload interval ----------
 UPLOAD_INTERVAL_SEC = 300  # 5 minutes
+
