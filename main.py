@@ -477,6 +477,7 @@ def is_valid_staff_id(staff_id_in):
         debug("Connecting to allocation_m3 for staff verification...")
         connection = mysql.connector.connect(
             host=STAFF_DB["host"],
+            port=int(STAFF_DB.get("port", 3306)),
             user=STAFF_DB["user"],
             password=STAFF_DB["password"],
             database=STAFF_DB["database"]
@@ -644,4 +645,5 @@ if __name__ == "__main__":
     debug("🧭 Listening for barcode scan via keyboard...")
     keyboard.on_press(on_key)
     keyboard.wait()
+
 
