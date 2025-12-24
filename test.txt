@@ -1,16 +1,38 @@
 nc -zv 192.168.20.17 3306
 python3 -c "import pymysql; from config import PRODUCTION_DB as C; conn=pymysql.connect(host=C['host'],port=C['port'],user=C['user'],password=C['password'],database=C['database'],connect_timeout=3); print('OK'); conn.close()"
 
-pi@raspberrypi:~ $ python3 -c "import pymysql; from config import PRODUCTION_DB as C; conn=pymysql.connect(host=C['host'],port=C['port'],user=C['user'],password=C['password'],database=C['database'],connect_timeout=3); print('OK'); conn.close()"
+pi@raspberrypi:~/gwim-scanner $ python3 -c "import pymysql; from config import PRODUCTION_DB as C; conn=pymysql.connect(host=C['host'],port=C['port'],user=C['user'],password=C['password'],database=C['database'],connect_timeout=3); print('OK'); conn.close()"
 Traceback (most recent call last):
   File "<string>", line 1, in <module>
-ModuleNotFoundError: No module named 'config'
-pi@raspberrypi:~ $ python3 -c /home/pi/gwim-scanner  "import pymysql; from config import PRODUCTION_DB as C; conn=pymysql.connect(host=C['host'],port=C['port'],user=C['user'],password=C['password'],database=C['database'],connect_timeout=3); print('OK'); conn.close()"
-  File "<string>", line 1
-    /home/pi/gwim-scanner
-    ^
-SyntaxError: invalid syntax
-pi@raspberrypi:~ $ python3 -c home/pi/gwim-scanner  "import pymysql; from config import PRODUCTION_DB as C; conn=pymysql.connect(host=C['host'],port=C['port'],user=C['user'],password=C['password'],database=C['database'],connect_timeout=3); print('OK'); conn.close()"
+  File "/usr/local/lib/python3.11/dist-packages/pymysql/connections.py", line 361, in __init__
+    self.connect()
+  File "/usr/local/lib/python3.11/dist-packages/pymysql/connections.py", line 669, in connect
+    self._request_authentication()
+  File "/usr/local/lib/python3.11/dist-packages/pymysql/connections.py", line 957, in _request_authentication
+    auth_packet = self._read_packet()
+                  ^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/dist-packages/pymysql/connections.py", line 775, in _read_packet
+    packet.raise_for_error()
+  File "/usr/local/lib/python3.11/dist-packages/pymysql/protocol.py", line 219, in raise_for_error
+    err.raise_mysql_exception(self._data)
+  File "/usr/local/lib/python3.11/dist-packages/pymysql/err.py", line 150, in raise_mysql_exception
+    raise errorclass(errno, errval)
+pymysql.err.OperationalError: (1045, "Access denied for user 'admin'@'180.75.52.141' (using password: YES)")
+pi@raspberrypi:~/gwim-scanner $ sudo python3 -c "import pymysql; from config import PRODUCTION_DB as C; conn=pymysql.connect(host=C['host'],port=C['port'],user=C['user'],password=C['password'],database=C['database'],connect_timeout=3); print('OK'); conn.close()"
 Traceback (most recent call last):
   File "<string>", line 1, in <module>
-NameError: name 'home' is not defined
+  File "/usr/local/lib/python3.11/dist-packages/pymysql/connections.py", line 361, in __init__
+    self.connect()
+  File "/usr/local/lib/python3.11/dist-packages/pymysql/connections.py", line 669, in connect
+    self._request_authentication()
+  File "/usr/local/lib/python3.11/dist-packages/pymysql/connections.py", line 957, in _request_authentication
+    auth_packet = self._read_packet()
+                  ^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/dist-packages/pymysql/connections.py", line 775, in _read_packet
+    packet.raise_for_error()
+  File "/usr/local/lib/python3.11/dist-packages/pymysql/protocol.py", line 219, in raise_for_error
+    err.raise_mysql_exception(self._data)
+  File "/usr/local/lib/python3.11/dist-packages/pymysql/err.py", line 150, in raise_mysql_exception
+    raise errorclass(errno, errval)
+pymysql.err.OperationalError: (1045, "Access denied for user 'admin'@'180.75.52.141' (using password: YES)")
+
