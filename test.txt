@@ -6,4 +6,29 @@ OK
 
 python3 -c "import mysql.connector as m; c=m.connect(host='192.168.20.17',port=3306,user='itadmin',password='itadmin@2018',database='allocation_m3',connection_timeout=3); print('STAFF OK'); c.close()"
 
+pi@raspberrypi:~ $ cd /home/pi/gwim-scanner/
+pi@raspberrypi:~/gwim-scanner $ python3 -c "import mysql.connector as m; c=m.connect(host='192.168.20.17',port=3306,user='itadmin',password='itadmin@2018',database='allocation_m3',connection_timeout=3); print('STAFF OK'); c.close()"
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.11/dist-packages/mysql/connector/network.py", line 795, in open_connection
+    self.sock.connect(sockaddr)
+TimeoutError: timed out
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+  File "/usr/local/lib/python3.11/dist-packages/mysql/connector/pooling.py", line 323, in connect
+    return MySQLConnection(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.11/dist-packages/mysql/connector/connection.py", line 185, in __init__
+    self.connect(**kwargs)
+  File "/usr/local/lib/python3.11/dist-packages/mysql/connector/abstracts.py", line 1604, in connect
+    self._open_connection()
+  File "/usr/local/lib/python3.11/dist-packages/mysql/connector/connection.py", line 411, in _open_connection
+    raise err
+  File "/usr/local/lib/python3.11/dist-packages/mysql/connector/connection.py", line 382, in _open_connection
+    self._socket.open_connection()
+  File "/usr/local/lib/python3.11/dist-packages/mysql/connector/network.py", line 797, in open_connection
+    raise ConnectionTimeoutError(
+mysql.connector.errors.ConnectionTimeoutError: 2003: Can't connect to MySQL server on '192.168.20.17:3306' (timed out)
 
