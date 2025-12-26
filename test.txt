@@ -4,5 +4,6 @@ python3 -c "import pymysql; from config import PRODUCTION_DB as C; conn=pymysql.
 pi@raspberrypi:~/gwim-scanner $ python3 -c "import pymysql; from config import PRODUCTION_DB as C; conn=pymysql.connect(host=C['host'],port=C['port'],user=C['user'],password=C['password'],database=C['database'],connect_timeout=3); print('OK'); conn.close()"
 OK
 
+python3 -c "import mysql.connector as m; c=m.connect(host='192.168.20.17',port=3306,user='itadmin',password='itadmin@2018',database='allocation_m3',connection_timeout=3); print('STAFF OK'); c.close()"
 
 
