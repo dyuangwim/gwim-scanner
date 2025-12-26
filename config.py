@@ -9,8 +9,8 @@
 PRODUCTION_DB = {
     "host": "149.28.152.191",
     "port": 23306,                 
-    "user": "admin",
-    "password": "QhGhXaAhp9PunJz9",
+    "user": "",
+    "password": "",
     "database": "production",
 }
 
@@ -18,8 +18,8 @@ PRODUCTION_DB = {
 STAFF_DB = {
     "host": "192.168.20.17",
     "port": 3306,
-    "user": "itadmin",
-    "password": "itadmin@2018",
+    "user": "",
+    "password": "",
     "database": "allocation_m3",
 }
 
@@ -42,4 +42,5 @@ DB_WRITE_TIMEOUT = 5
 
 # ---------- Upload interval ----------
 UPLOAD_INTERVAL_SEC = 300  # 5 minutes
+
 
