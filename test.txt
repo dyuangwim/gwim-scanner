@@ -1,1 +1,5 @@
-python3 -c "import mysql.connector as m; from config import STAFF_DB as C; c=m.connect(host=C['host'],port=int(C.get('port',3306)),user=C['user'],password=C['password'],database=C['database'],connection_timeout=3); print('STAFF DB OK'); c.close()"
+raspberry_pi_scanner_led
+OAbLvYkknKs*p0IQ
+
+itadmin
+itadmin@2018
