@@ -257,7 +257,42 @@ def resolve_image_url(path):
     path = (path or "").strip().lstrip("../")
     return f"http://192.168.20.17/{path}"
 
-# ===================== DB Connect helpers (NEW, minimal) =====================
+def compute_shift_value(now_dt: datetime, overlap_hint=None, overlap_window=None) -> str:
+    """
+    Compute shift by scan time using supervisor rule:
+      - DAY: 06:30AM - 07:00PM
+      - NIGHT: 06:30PM - 07:00AM
+    Note: There are overlap windows (06:30-07:00 and 18:30-19:00). If overlap_hint is provided
+    (typically from prod_attendance shift), we will use it. Otherwise we default by window:
+      - morning overlap (06:30-07:00) -> DAY
+      - evening overlap (18:30-19:00) -> NIGHT
+    """
+    minutes = now_dt.hour * 60 + now_dt.minute
+    day_start = 6 * 60 + 30      # 06:30
+    eve_overlap = 18 * 60 + 30   # 18:30
+    day_end = 19 * 60           # 19:00
+    night_end = 7 * 60          # 07:00
+
+    # Non-overlap DAY: 07:00 - 18:30
+    if night_end <= minutes < eve_overlap:
+        return "DAY"
+
+    # Non-overlap NIGHT: 19:00 - 24:00 and 00:00 - 06:30
+    if minutes >= day_end or minutes < day_start:
+        return "NIGHT"
+
+    # Overlap windows: 06:30-07:00 or 18:30-19:00
+    if overlap_hint:
+        hint = str(overlap_hint).strip().upper()
+        if hint in ("DAY", "NIGHT"):
+            return hint
+
+    # Default by which overlap window we are in
+    if day_start <= minutes < night_end:
+        return "DAY"     # 06:30-07:00
+    return "NIGHT"       # 18:30-19:00
+
+
 def connect_production(dict_cursor=False):
     kwargs = dict(
         host=PRODUCTION_DB["host"],
@@ -283,6 +318,10 @@ last_scan_time = 0
 last_barcode = None
 barcode_buffer = ""
 staff_id = None
+
+# Per-staff anti-double-scan (seconds) for STAFF barcodes only
+STAFF_MIN_INTERVAL_SEC = 60
+staff_last_scan_ts = {}
 
 csv_lock = threading.Lock()
 
@@ -537,15 +576,31 @@ def on_key(event):
             debug("✅ Green light blinking restarted (RESET)")
             return
 
-        # Staff (MULTI-USER, per-staff toggle; does NOT lock to a single active staff)
+                # Staff (MULTI-USER, per-staff toggle; per-staff 60s anti-double-scan; does NOT affect production scanned_by)
         if any(c.isalpha() for c in normalized_barcode):
             debug("Detected alpha -> treat as staff barcode")
+
+            # Preserve production green state:
+            # - If template already set, green should stay SOLID ON after staff scan feedback blink.
+            green_should_be_solid = template_code is not None
+
+            # Per-staff anti-double-scan: same staff must wait >= 60s between scans
+            last_staff_ts = staff_last_scan_ts.get(normalized_barcode)
+            if last_staff_ts is not None and (now_ts - last_staff_ts) < STAFF_MIN_INTERVAL_SEC:
+                debug(f"⏱️ Staff scan ignored (<{STAFF_MIN_INTERVAL_SEC}s): {normalized_barcode}")
+                if green_should_be_solid:
+                    set_light(GREEN_PIN, True)
+                return
 
             # 1) Validate staff barcode first (OPERATOR only)
             if not is_valid_staff_id(normalized_barcode):
                 debug(f"Invalid staff ID: {normalized_barcode}")
                 start_red_buzzer_alert()
+                if green_should_be_solid:
+                    set_light(GREEN_PIN, True)
                 return
+
+            debug(f"✅ Staff validated (OPERATOR): {normalized_barcode}")
 
             connection = None
             try:
@@ -557,27 +612,26 @@ def on_key(event):
                 )
                 cursor = connection.cursor(dictionary=True)
 
-                today_str = datetime.now().strftime("%Y-%m-%d")
                 now_dt = datetime.now()
 
-                # 2) Fetch staff details (used by all 3 tables)
+                # 2) Get staff details
                 cursor.execute("SELECT * FROM staff_list WHERE staffid = %s", (normalized_barcode,))
                 staff_row = cursor.fetchone()
                 if not staff_row:
                     debug("❌ Staff ID not found in DB after validation")
                     start_red_buzzer_alert()
+                    if green_should_be_solid:
+                        set_light(GREEN_PIN, True)
                     return
 
-                shift = (staff_row.get("shift") or "").upper()
-                shift_value = "DAY" if "DAY" in shift else ("NIGHT" if "NIGHT" in shift else "")
-
                 pic_url = resolve_image_url(staff_row.get("pic") or "")
+                debug(f"👷 Staff info: id={normalized_barcode}, name={staff_row.get('staffname')}, pos={staff_row.get('staffpos')}, dept={staff_row.get('staffdept')}, agency={staff_row.get('staffagency','')}")
+
+                # Work date is ALWAYS today (no cross-midnight remapping)
+                work_date_str = now_dt.strftime("%Y-%m-%d")
+
 
                 # 3) allocation_temp (per-staff toggle; staffid is UNIQUE)
-                # Boss requirement:
-                #   1st scan -> INSERT status='IN'
-                #   2nd scan -> UPDATE status='OUT'
-                #   3rd scan -> UPDATE status='IN' (toggle forever)
                 cursor.execute(
                     "SELECT status FROM allocation_temp WHERE staffid = %s LIMIT 1",
                     (normalized_barcode,)
@@ -589,6 +643,7 @@ def on_key(event):
 
                 toggle_to_in = True if not temp_row else (prev_status_u != "IN")
                 new_status = "IN" if toggle_to_in else "OUT"
+                debug(f"🧭 allocation_temp toggle: prev_status={prev_status_u or 'NULL'} -> new_status={new_status} (exists={bool(temp_row)})")
 
                 if not temp_row:
                     cursor.execute("""
@@ -623,103 +678,116 @@ def on_key(event):
                         normalized_barcode
                     ))
 
-                # 4) allcation_log (KEEP EXISTING/OLD BEHAVIOR)
-                # NOTE: This logic is "per-day record" style as in your old staff file.
-                if toggle_to_in:
-                    cursor.execute(
-                        "SELECT id FROM allcation_log WHERE employee_id = %s AND date_run = %s",
-                        (normalized_barcode, today_str)
-                    )
-                    log_row = cursor.fetchone()
-                    if log_row:
+                # 4) prod_attendance (SHIFT source of truth)
+                #    Rule from supervisor:
+                #      DAY   : 06:30AM - 07:00PM
+                #      NIGHT : 06:30PM - 07:00AM
+                #    Overlap windows exist; we lock to prod_attendance.shift once it exists.
+                cursor.execute(
+                    "SELECT id, shift FROM prod_attendance WHERE staffid = %s AND date = %s",
+                    (normalized_barcode, work_date_str)
+                )
+                att_row = cursor.fetchone()
+                debug(f"📋 prod_attendance lookup: date={work_date_str}, found={bool(att_row)}, shift_in_db={(att_row.get('shift') if att_row else None)}")
+
+                # If we need to compute shift (first record, or shift empty), do it here.
+                shift_value = None
+                if att_row and (att_row.get("shift") or "").strip():
+                    shift_value = (att_row.get("shift") or "").strip().upper()
+                    debug(f"🕒 shift locked from prod_attendance: {shift_value}")
+                else:
+                    # In overlap windows, try to reuse the most recent prod_attendance.shift for this staff as hint
+                    minutes = now_dt.hour * 60 + now_dt.minute
+                    in_overlap = (6 * 60 + 30 <= minutes < 7 * 60) or (18 * 60 + 30 <= minutes < 19 * 60)
+                    overlap_hint = None
+                    if in_overlap:
                         cursor.execute(
-                            "UPDATE allcation_log SET out_datetime = %s, status = 'OUT' WHERE id = %s",
-                            (now_dt, log_row["id"])
+                            "SELECT shift FROM prod_attendance "
+                            "WHERE staffid = %s AND shift IS NOT NULL AND TRIM(shift) <> '' "
+                            "ORDER BY date DESC, id DESC LIMIT 1",
+                            (normalized_barcode,)
+                        )
+                        last_shift_row = cursor.fetchone()
+                        if last_shift_row and (last_shift_row.get("shift") or "").strip():
+                            overlap_hint = (last_shift_row.get("shift") or "").strip().upper()
+
+                    shift_value = compute_shift_value(now_dt, overlap_hint=overlap_hint)
+                    debug(f"🕒 shift computed: time={now_dt.strftime('%H:%M:%S')}, overlap_hint={overlap_hint}, shift_value={shift_value}")
+
+                if att_row:
+                    # Keep existing logic: always update timeout; only fill shift if it was empty
+                    if not (att_row.get("shift") or "").strip():
+                        cursor.execute(
+                            "UPDATE prod_attendance SET timeout = %s, shift = %s WHERE id = %s",
+                            (now_dt, shift_value, att_row["id"])
                         )
                     else:
-                        cursor.execute("""
-                            INSERT INTO allcation_log (
-                                line, employee_id, name, job_title, department, datetime_log, status, remark,
-                                file_path, date_run, in_datetime, out_datetime, time_taken, shift
-                            ) VALUES (%s, %s, %s, %s, %s, %s, 'IN', '', %s, %s, %s, NULL, 0.00, %s)
-                        """, (
-                            DEVICE_LINE,
-                            normalized_barcode,
-                            staff_row.get("staffname"),
-                            staff_row.get("staffpos"),
-                            staff_row.get("staffdept"),
-                            now_dt,
-                            pic_url,
-                            today_str,
-                            now_dt,
-                            shift_value
-                        ))
-                else:
-                    cursor.execute(
-                        "SELECT id FROM allcation_log WHERE employee_id = %s AND date_run = %s",
-                        (normalized_barcode, today_str)
-                    )
-                    row = cursor.fetchone()
-                    if row:
-                        cursor.execute(
-                            "UPDATE allcation_log SET out_datetime = %s, status = 'OUT' WHERE id = %s",
-                            (now_dt, row["id"])
-                        )
-
-                # 5) prod_attendance (KEEP EXISTING/OLD BEHAVIOR)
-                if toggle_to_in:
-                    cursor.execute(
-                        "SELECT id FROM prod_attendance WHERE staffid = %s AND date = %s",
-                        (normalized_barcode, today_str)
-                    )
-                    att_row = cursor.fetchone()
-                    if att_row:
+                        debug(f"📝 prod_attendance update: id={att_row['id']} timeout={now_dt}")
                         cursor.execute(
                             "UPDATE prod_attendance SET timeout = %s WHERE id = %s",
                             (now_dt, att_row["id"])
                         )
-                    else:
-                        cursor.execute("""
-                            INSERT INTO prod_attendance (
-                                staffid, name, staffpos, staffdept, timein, timeout, work_hr, pic, staffic,
-                                date, shift, flg, staffagency, day
-                            ) VALUES (%s, %s, %s, %s, %s, NULL, 0.00, %s, NULL, %s, %s, NULL, %s, %s)
-                        """, (
-                            normalized_barcode,
-                            staff_row.get("staffname"),
-                            staff_row.get("staffpos"),
-                            staff_row.get("staffdept"),
-                            now_dt,
-                            pic_url,
-                            today_str,
-                            shift_value,
-                            staff_row.get("staffagency", ""),
-                            calendar.day_name[now_dt.weekday()]
-                        ))
                 else:
-                    cursor.execute(
-                        "SELECT id FROM prod_attendance WHERE staffid = %s AND date = %s",
-                        (normalized_barcode, today_str)
-                    )
-                    row = cursor.fetchone()
-                    if row:
-                        cursor.execute(
-                            "UPDATE prod_attendance SET timeout = %s WHERE id = %s",
-                            (now_dt, row["id"])
-                        )
+                    debug(f"📝 prod_attendance insert: date={work_date_str} timein={now_dt} shift={shift_value}")
+                    cursor.execute("""
+                        INSERT INTO prod_attendance (
+                            staffid, name, staffpos, staffdept, timein, timeout, work_hr, pic, staffic,
+                            date, shift, flg, staffagency, day
+                        ) VALUES (%s, %s, %s, %s, %s, NULL, 0.00, %s, NULL, %s, %s, NULL, %s, %s)
+                    """, (
+                        normalized_barcode,
+                        staff_row.get("staffname"),
+                        staff_row.get("staffpos"),
+                        staff_row.get("staffdept"),
+                        now_dt,
+                        pic_url,
+                        work_date_str,
+                        shift_value,
+                        staff_row.get("staffagency", ""),
+                        calendar.day_name[now_dt.weekday()]
+                    ))
+
+# 5) allcation_log (NEW REQUIREMENT: INSERT a new record on EVERY staff scan)
+                debug(f"🧾 allcation_log insert: status={new_status} datetime_log={now_dt} date_run={work_date_str} shift={shift_value}")
+                cursor.execute("""
+                    INSERT INTO allcation_log (
+                        line, employee_id, name, job_title, department, datetime_log, status, remark,
+                        file_path, date_run, in_datetime, out_datetime, time_taken, shift
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, '', %s, %s, %s, NULL, 0.00, %s)
+                """, (
+                    DEVICE_LINE,
+                    normalized_barcode,
+                    staff_row.get("staffname"),
+                    staff_row.get("staffpos"),
+                    staff_row.get("staffdept"),
+                    now_dt,
+                    new_status,
+                    pic_url,
+                    work_date_str,
+                    now_dt,
+                    shift_value
+                ))
 
                 connection.commit()
 
-                debug(f"✅ Staff toggled: {normalized_barcode} -> {new_status}")
-                # IMPORTANT: Do NOT set global staff_id here (multi-user mode).
-                # Production scanned_by remains DEVICE_ID (existing behavior when staff_id is None).
+                # Update per-staff last scan time after successful commit
+                staff_last_scan_ts[normalized_barcode] = now_ts
+
+                debug(f"✅ Staff toggled: {normalized_barcode} -> {new_status} (work_date={work_date_str}, shift={shift_value})")
                 blink_light(GREEN_PIN, times=1)
                 buzz(times=1)
+
+                if green_should_be_solid:
+                    set_light(GREEN_PIN, True)
+                    debug("💡 Restored GREEN solid (template already set)")
+
                 return
 
             except Exception as e:
                 debug(f"🔥 Error during staff scan: {e}")
                 start_red_buzzer_alert()
+                if green_should_be_solid:
+                    set_light(GREEN_PIN, True)
                 return
 
             finally:
@@ -729,7 +797,7 @@ def on_key(event):
                 except Exception:
                     pass
 
-        # Must RESET first
+# Must RESET first
         if not current_batch:
             debug("⚠️ Please scan RESET first.")
             start_red_buzzer_alert()
