@@ -3,3 +3,50 @@ OAbLvYkknKs*p0IQ
 
 itadmin
 itadmin@2018
+
+
+
+[DEBUG] 🔁 Script started (log ready)
+[DEBUG] ✅ Logs folder writable: /home/pi/gwim-scanner/logs
+[DEBUG] 🔌 GPIO initialized
+[DEBUG] ERROR_ALERT_MODE=blink
+[DEBUG] CHANNEL_ACTIVE_LOW={'RED': False, 'GREEN': False, 'YELLOW': False, 'BUZZER': False}
+[DEBUG] ⏫ Attempting to upload cached CSV data...
+[DEBUG] Initial green light blinking started.
+[DEBUG] 🧭 Listening for barcode scan via keyboard...
+[DEBUG] 📥 Scanned barcode: '123456789' → normalized: '123456789'
+[DEBUG] STATE before: batch=None, muf=None, template=None, staff=None
+[DEBUG] Stopping all active alerts...
+[DEBUG] All alerts stopped.
+[DEBUG] 🔄 RESET scanned. Starting new batch
+[DEBUG] ✅ Green light blinking restarted (RESET)
+[DEBUG] 📥 Scanned barcode: '609914709−1' → normalized: '609914709-1'
+[DEBUG] STATE before: batch=batch_20260113_094523, muf=None, template=None, staff=None
+[DEBUG] Stopping all active alerts...
+[DEBUG] All alerts stopped.
+[DEBUG] Querying table 'main' for muf_no = '609914709-1'
+[DEBUG] ✅ MUF found: 609914709-1
+[DEBUG] Green continues blinking until template set.
+[DEBUG] 📥 Scanned barcode: '039800117274' → normalized: '039800117274'
+[DEBUG] STATE before: batch=batch_20260113_094523, muf=609914709-1, template=None, staff=None
+[DEBUG] Stopping all active alerts...
+[DEBUG] All alerts stopped.
+[DEBUG] 🧾 Template barcode set: 039800117274
+[DEBUG] ✅ Green light solid ON (Template Set)
+[DEBUG] ✅ DB insert successful
+[DEBUG] 📂 Written to CSV: /home/pi/gwim-scanner/logs/609914709-1_20260113.csv (uploaded=1, remarks=TEMPLATE)
+[DEBUG] 📥 Scanned barcode: '039800117274' → normalized: '039800117274'
+[DEBUG] STATE before: batch=batch_20260113_094523, muf=609914709-1, template=039800117274, staff=None
+[DEBUG] Stopping all active alerts...
+[DEBUG] All alerts stopped.
+[DEBUG] ✅ Carton matches template: 039800117274
+[DEBUG] ✅ DB insert successful
+[DEBUG] 📂 Written to CSV: /home/pi/gwim-scanner/logs/609914709-1_20260113.csv (uploaded=1, remarks=SCAN)
+[DEBUG] 📥 Scanned barcode: 'm3p560' → normalized: 'M3P560'
+[DEBUG] STATE before: batch=batch_20260113_094523, muf=609914709-1, template=039800117274, staff=None
+[DEBUG] Stopping all active alerts...
+[DEBUG] All alerts stopped.
+[DEBUG] Detected alpha -> treat as staff barcode
+[DEBUG] Connecting to allocation_m3 for staff verification...
+[DEBUG] Retrieved 2176 staff IDs
+[DEBUG] ✅ Staff IN: M3P560
