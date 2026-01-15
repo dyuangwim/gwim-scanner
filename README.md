@@ -70,7 +70,7 @@ Optional:
 
 Software Components
 -------------------
-main_staff_fixed_v4_debug.py
+main.py
 - Main scanner logic
 - Production scanning
 - Staff attendance
@@ -142,11 +142,12 @@ Buzzer:
 
 Project Structure
 -----------------
-gwim-scanner/
-- main_staff_fixed_v4_debug.py
-- api_server.py
-- config.py
-- code.py
-- stretch_bdf_vertically.py
-- logs/
-- README.md
+pi4/
+  Code running on Raspberry Pi 4 Model B.
+  Handles barcode scanning, database connection,
+  GPIO control, and Flask API.
+
+pico_w/
+  Code running on Raspberry Pi Pico W (CircuitPython).
+  Handles HUB75 LED matrix display and Wi-Fi communication.
+
