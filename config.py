@@ -29,7 +29,7 @@ STAFF_GWI_DB = {
     "port": ,
     "user": "",
     "password": "",
-    "database": "",
+    "database": "staff_gwidb",
 }
 
 # ---------- Device identity ----------
@@ -51,4 +51,5 @@ DB_WRITE_TIMEOUT = 5
 
 # ---------- Upload interval ----------
 UPLOAD_INTERVAL_SEC = 300  # 5 minutes
+
 
