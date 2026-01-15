@@ -116,3 +116,7 @@ Maintenance Notes
 - Always power OFF before rewiring
 - Double-check GPIO numbers before testing
 - After hardware change, verify ACTIVE_LOW setting
+
+
+<img width="1350" height="757" alt="image" src="https://github.com/user-attachments/assets/36acfce7-5a67-47a8-b8ac-878887d60f04" />
+<img width="940" height="529" alt="image" src="https://github.com/user-attachments/assets/ffe54bc7-d49e-40fd-bb46-c56f88f79b95" />
