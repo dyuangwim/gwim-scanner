@@ -6,30 +6,30 @@
 
 # ---------- Production DB (for MUF lookup + output_log insert) ----------
 PRODUCTION_DB = {
-    "host": "149.28.152.191",      # <-- intranet DB
-    "port": 13306,
-    "user": "raspberry_pi_scanner_led",            # <-- change to the correct DB user
-    "password": "OAbLvYkknKs*p0IQ",   # <-- change to the correct DB password
+    "host": "",      # <-- intranet DB
+    "port": ,
+    "user": "",            # <-- change to the correct DB user
+    "password": "",   # <-- change to the correct DB password
     "database": "production",
 }
 
 # ---------- Staff DB (allocation_m3) ----------
 STAFF_DB = {
-    "host": "192.168.20.17",
-    "port": 3306,
-    "user": "itadmin",
-    "password": "itadmin@2018",
+    "host": "",
+    "port": ,
+    "user": "",
+    "password": "",
     "database": "allocation_m3",
 }
 
 # ---------- Staff List DB (staff_gwidb) ----------
 # Same host/port/user/password as allocation_m3, only database different
 STAFF_GWI_DB = {
-    "host": "192.168.20.17",
-    "port": 3306,
-    "user": "itadmin",
-    "password": "itadmin@2018",
-    "database": "staff_gwidb",
+    "host": "",
+    "port": ,
+    "user": "",
+    "password": "",
+    "database": "",
 }
 
 # ---------- Device identity ----------
@@ -51,3 +51,4 @@ DB_WRITE_TIMEOUT = 5
 
 # ---------- Upload interval ----------
 UPLOAD_INTERVAL_SEC = 300  # 5 minutes
+
