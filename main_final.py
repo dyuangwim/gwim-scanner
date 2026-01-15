@@ -13,7 +13,7 @@ import mysql.connector
 import calendar
 
 from config import (
-    PRODUCTION_DB, STAFF_DB,
+    PRODUCTION_DB, STAFF_DB, STAFF_GWI_DB,
     DEVICE_LINE, DEVICE_ID,
     CSV_FOLDER, LOG_PATH,
     RESET_CODES, SCAN_INTERVAL,
@@ -309,6 +309,32 @@ def connect_production(dict_cursor=False):
         kwargs["cursorclass"] = pymysql.cursors.DictCursor
     return pymysql.connect(**kwargs)
 
+def connect_allocation_m3(dict_cursor=False):
+    kwargs = dict(
+        host=STAFF_DB["host"],
+        user=STAFF_DB["user"],
+        password=STAFF_DB["password"],
+        database=STAFF_DB["database"],
+        port=int(STAFF_DB.get("port", 3306)),
+        autocommit=False,
+    )
+    if dict_cursor:
+        kwargs["dictionary"] = True
+    return mysql.connector.connect(**kwargs)
+
+def connect_staff_gwidb(dict_cursor=False):
+    kwargs = dict(
+        host=STAFF_GWI_DB["host"],
+        user=STAFF_GWI_DB["user"],
+        password=STAFF_GWI_DB["password"],
+        database=STAFF_GWI_DB["database"],
+        port=int(STAFF_GWI_DB.get("port", 3306)),
+    )
+    conn = mysql.connector.connect(**kwargs)
+    if dict_cursor:
+        return conn, conn.cursor(dictionary=True)
+    return conn, conn.cursor()
+
 # ===================== Global vars =====================
 current_batch = None
 current_muf = None
@@ -471,7 +497,6 @@ def upload_from_csv():
 
             for row in pending:
                 # Map using our known header order CSV_HEADER
-                # If old files exist, still handle by header index
                 def get(col):
                     return row[headers.index(col)] if col in headers and headers.index(col) < len(row) else None
 
@@ -510,25 +535,98 @@ def upload_from_csv():
 
     threading.Timer(UPLOAD_INTERVAL_SEC, upload_from_csv).start()
 
-# ===================== Staff verification (keep old behavior, use STAFF_DB) =====================
-def is_valid_staff_id(staff_id_in):
-    try:
-        debug("Connecting to allocation_m3 for staff verification...")
-        connection = mysql.connector.connect(
-            host=STAFF_DB["host"],
-            user=STAFF_DB["user"],
-            password=STAFF_DB["password"],
-            database=STAFF_DB["database"]
-        )
-        cursor = connection.cursor()
-        cursor.execute("SELECT staffid FROM staff_list WHERE staffpos = 'OPERATOR'")
-        valid_ids = {row[0].strip().upper() for row in cursor.fetchall()}
-        connection.close()
-        debug(f"Retrieved {len(valid_ids)} staff IDs")
-        return staff_id_in.upper() in valid_ids
-    except Exception as e:
-        debug(f"Staff DB connection error: {e}")
+# ===================== Staff verification (UPDATED: use staff_gwidb.staff_list) =====================
+def is_valid_staff_id(staff_id_in: str) -> bool:
+    """
+    Validate OPERATOR staffid from staff_gwidb.staff_list.
+    Duplicate staffid rule (supervisor):
+      - If returned > 1 rows, ONLY accept if any row has factory='m3'
+    """
+    sid = (staff_id_in or "").strip().upper()
+    if not sid:
         return False
+
+    conn = None
+    cur = None
+    try:
+        debug("Connecting to staff_gwidb for staff verification...")
+        conn, cur = connect_staff_gwidb(dict_cursor=True)
+
+        # More efficient than fetching all operators:
+        cur.execute(
+            "SELECT staffid, factory FROM staff_list WHERE staffpos = 'OPERATOR' AND UPPER(staffid) = %s",
+            (sid,)
+        )
+        rows = cur.fetchall() or []
+        debug(f"staff_gwidb.staff_list lookup: staffid={sid}, rows={len(rows)}")
+
+        if len(rows) == 0:
+            return False
+
+        if len(rows) == 1:
+            return True
+
+        # duplicate -> must match factory='m3'
+        for r in rows:
+            fac = (r.get("factory") or "").strip().lower()
+            if fac == "m3":
+                debug("Duplicate staffid detected -> using factory='m3' match ✅")
+                return True
+
+        debug("Duplicate staffid detected but no factory='m3' row ❌")
+        return False
+
+    except Exception as e:
+        debug(f"Staff GWIDB connection/query error: {e}")
+        return False
+    finally:
+        try:
+            if cur:
+                cur.close()
+        except Exception:
+            pass
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+def fetch_staff_row_from_gwidb(staffid_norm: str):
+    """
+    Fetch staff row from staff_gwidb.staff_list.
+    If multiple rows, prefer factory='m3'. Else take first.
+    """
+    conn = None
+    cur = None
+    sid = (staffid_norm or "").strip().upper()
+    try:
+        conn, cur = connect_staff_gwidb(dict_cursor=True)
+        cur.execute("SELECT * FROM staff_list WHERE UPPER(staffid) = %s", (sid,))
+        rows = cur.fetchall() or []
+        if not rows:
+            return None
+        if len(rows) == 1:
+            return rows[0]
+
+        # prefer factory='m3'
+        for r in rows:
+            if (r.get("factory") or "").strip().lower() == "m3":
+                return r
+        return rows[0]
+    except Exception as e:
+        debug(f"fetch_staff_row_from_gwidb error: {e}")
+        return None
+    finally:
+        try:
+            if cur:
+                cur.close()
+        except Exception:
+            pass
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
 
 # ===================== Barcode listener (KEEP YOUR PERFECT FLOW ORDER) =====================
 def on_key(event):
@@ -576,7 +674,7 @@ def on_key(event):
             debug("✅ Green light blinking restarted (RESET)")
             return
 
-                # Staff (MULTI-USER, per-staff toggle; per-staff 60s anti-double-scan; does NOT affect production scanned_by)
+        # Staff (MULTI-USER, per-staff toggle; per-staff 60s anti-double-scan; does NOT affect production scanned_by)
         if any(c.isalpha() for c in normalized_barcode):
             debug("Detected alpha -> treat as staff barcode")
 
@@ -592,7 +690,7 @@ def on_key(event):
                     set_light(GREEN_PIN, True)
                 return
 
-            # 1) Validate staff barcode first (OPERATOR only)
+            # 1) Validate staff barcode first (OPERATOR only) from staff_gwidb.staff_list
             if not is_valid_staff_id(normalized_barcode):
                 debug(f"Invalid staff ID: {normalized_barcode}")
                 start_red_buzzer_alert()
@@ -602,34 +700,34 @@ def on_key(event):
 
             debug(f"✅ Staff validated (OPERATOR): {normalized_barcode}")
 
+            # 2) Get staff details from staff_gwidb.staff_list (duplicate -> prefer factory='m3')
+            staff_row = fetch_staff_row_from_gwidb(normalized_barcode)
+            if not staff_row:
+                debug("❌ Staff ID not found in staff_gwidb.staff_list after validation")
+                start_red_buzzer_alert()
+                if green_should_be_solid:
+                    set_light(GREEN_PIN, True)
+                return
+
+            pic_url = resolve_image_url(staff_row.get("pic") or "")
+            debug(f"👷 Staff info: id={normalized_barcode}, name={staff_row.get('staffname')}, pos={staff_row.get('staffpos')}, dept={staff_row.get('staffdept')}, agency={staff_row.get('staffagency','')}, factory={staff_row.get('factory','')}")
+
+            # 3) Now do allocation_m3 operations (allocation_temp/prod_attendance/allcation_log) using STAFF_DB (unchanged)
             connection = None
             try:
                 connection = mysql.connector.connect(
                     host=STAFF_DB["host"],
                     user=STAFF_DB["user"],
                     password=STAFF_DB["password"],
-                    database=STAFF_DB["database"]
+                    database=STAFF_DB["database"],
+                    port=int(STAFF_DB.get("port", 3306)),
                 )
                 cursor = connection.cursor(dictionary=True)
 
                 now_dt = datetime.now()
 
-                # 2) Get staff details
-                cursor.execute("SELECT * FROM staff_list WHERE staffid = %s", (normalized_barcode,))
-                staff_row = cursor.fetchone()
-                if not staff_row:
-                    debug("❌ Staff ID not found in DB after validation")
-                    start_red_buzzer_alert()
-                    if green_should_be_solid:
-                        set_light(GREEN_PIN, True)
-                    return
-
-                pic_url = resolve_image_url(staff_row.get("pic") or "")
-                debug(f"👷 Staff info: id={normalized_barcode}, name={staff_row.get('staffname')}, pos={staff_row.get('staffpos')}, dept={staff_row.get('staffdept')}, agency={staff_row.get('staffagency','')}")
-
-                # Work date is ALWAYS today (no cross-midnight remapping)
+                # Work date is ALWAYS today (no cross-midnight remapping)  <-- keep your current behavior
                 work_date_str = now_dt.strftime("%Y-%m-%d")
-
 
                 # 3) allocation_temp (per-staff toggle; staffid is UNIQUE)
                 cursor.execute(
@@ -679,10 +777,6 @@ def on_key(event):
                     ))
 
                 # 4) prod_attendance (SHIFT source of truth)
-                #    Rule from supervisor:
-                #      DAY   : 06:30AM - 07:00PM
-                #      NIGHT : 06:30PM - 07:00AM
-                #    Overlap windows exist; we lock to prod_attendance.shift once it exists.
                 cursor.execute(
                     "SELECT id, shift FROM prod_attendance WHERE staffid = %s AND date = %s",
                     (normalized_barcode, work_date_str)
@@ -690,13 +784,11 @@ def on_key(event):
                 att_row = cursor.fetchone()
                 debug(f"📋 prod_attendance lookup: date={work_date_str}, found={bool(att_row)}, shift_in_db={(att_row.get('shift') if att_row else None)}")
 
-                # If we need to compute shift (first record, or shift empty), do it here.
                 shift_value = None
                 if att_row and (att_row.get("shift") or "").strip():
                     shift_value = (att_row.get("shift") or "").strip().upper()
                     debug(f"🕒 shift locked from prod_attendance: {shift_value}")
                 else:
-                    # In overlap windows, try to reuse the most recent prod_attendance.shift for this staff as hint
                     minutes = now_dt.hour * 60 + now_dt.minute
                     in_overlap = (6 * 60 + 30 <= minutes < 7 * 60) or (18 * 60 + 30 <= minutes < 19 * 60)
                     overlap_hint = None
@@ -715,7 +807,6 @@ def on_key(event):
                     debug(f"🕒 shift computed: time={now_dt.strftime('%H:%M:%S')}, overlap_hint={overlap_hint}, shift_value={shift_value}")
 
                 if att_row:
-                    # Keep existing logic: always update timeout; only fill shift if it was empty
                     if not (att_row.get("shift") or "").strip():
                         cursor.execute(
                             "UPDATE prod_attendance SET timeout = %s, shift = %s WHERE id = %s",
@@ -747,7 +838,7 @@ def on_key(event):
                         calendar.day_name[now_dt.weekday()]
                     ))
 
-# 5) allcation_log (NEW REQUIREMENT: INSERT a new record on EVERY staff scan)
+                # 5) allcation_log (INSERT a new record on EVERY staff scan)
                 debug(f"🧾 allcation_log insert: status={new_status} datetime_log={now_dt} date_run={work_date_str} shift={shift_value}")
                 cursor.execute("""
                     INSERT INTO allcation_log (
@@ -785,6 +876,11 @@ def on_key(event):
 
             except Exception as e:
                 debug(f"🔥 Error during staff scan: {e}")
+                try:
+                    if connection:
+                        connection.rollback()
+                except Exception:
+                    pass
                 start_red_buzzer_alert()
                 if green_should_be_solid:
                     set_light(GREEN_PIN, True)
@@ -797,7 +893,7 @@ def on_key(event):
                 except Exception:
                     pass
 
-# Must RESET first
+        # Must RESET first
         if not current_batch:
             debug("⚠️ Please scan RESET first.")
             start_red_buzzer_alert()
@@ -878,4 +974,3 @@ if __name__ == "__main__":
     debug("🧭 Listening for barcode scan via keyboard...")
     keyboard.on_press(on_key)
     keyboard.wait()
-
