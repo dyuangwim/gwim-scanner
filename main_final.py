@@ -725,6 +725,7 @@ def on_key(event):
                 cursor = connection.cursor(dictionary=True)
 
                 now_dt = datetime.now()
+                now_dt_sec = now_dt.replace(microsecond=0)
 
                 # Work date is ALWAYS today (no cross-midnight remapping)  <-- keep your current behavior
                 work_date_str = now_dt.strftime("%Y-%m-%d")
@@ -851,11 +852,11 @@ def on_key(event):
                     staff_row.get("staffname"),
                     staff_row.get("staffpos"),
                     staff_row.get("staffdept"),
-                    now_dt,
+                    now_dt_sec,
                     new_status,
                     pic_url,
                     work_date_str,
-                    now_dt,
+                    now_dt_sec,
                     shift_value
                 ))
 
