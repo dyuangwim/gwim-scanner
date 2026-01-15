@@ -1,0 +1,11 @@
+GPIO Mapping
+RED    -> GPIO 5
+GREEN  -> GPIO 6
+YELLOW -> GPIO 13
+BUZZER -> GPIO 19
+
+Relay Mode:
+ACTIVE_LOW = True
+
+LED Mode:
+ACTIVE_LOW = False
