@@ -554,7 +554,7 @@ def is_valid_staff_id(staff_id_in: str) -> bool:
 
         # More efficient than fetching all operators:
         cur.execute(
-            "SELECT staffid, factory FROM staff_list WHERE staffpos = 'OPERATOR' AND UPPER(staffid) = %s",
+            "SELECT staffid, factory FROM staff_list WHERE UPPER(staffid) = %s",
             (sid,)
         )
         rows = cur.fetchall() or []
@@ -698,7 +698,7 @@ def on_key(event):
                     set_light(GREEN_PIN, True)
                 return
 
-            debug(f"✅ Staff validated (OPERATOR): {normalized_barcode}")
+            debug(f"✅ Staff validated (staff exists): {normalized_barcode}")
 
             # 2) Get staff details from staff_gwidb.staff_list (duplicate -> prefer factory='m3')
             staff_row = fetch_staff_row_from_gwidb(normalized_barcode)
